@@ -4,8 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List
 
-from .event_types import EventType
-
+from .taxonomy_rules import EventType
 
 @dataclass
 class Entities:

@@ -92,9 +92,6 @@ class HeadlinesInput(BaseModel):
 class TrendingFeedsInput(BaseModel):
     feed_type: str = Field(default="hot_news", description="Feed type, usually hot_news.")
     limit: int = Field(default=8, ge=1, le=20, description="Number of trending items to fetch.")
-    cursor: str = Field(
-        description="Opaque pagination cursor returned by the previous get_trending_feeds call. Pass it back unchanged. Use an empty string for the first page."
-    )
 
 
 class ProjectFeedInput(BaseModel):
@@ -120,9 +117,6 @@ class ProjectOpinionsInput(BaseModel):
 class SearchInput(BaseModel):
     query: str = Field(description="Search query for Followin content.")
     limit: int = Field(default=8, ge=1, le=20, description="Number of search results to fetch.")
-    cursor: str = Field(
-        description="Opaque pagination cursor returned by the previous search_content call. Pass it back unchanged. Use an empty string for the first page."
-    )
 
 
 class TopicsInput(BaseModel):
@@ -289,7 +283,7 @@ class FollowinChatAgent:
             StructuredTool.from_function(
                 func=self._tool_get_trending_feeds,
                 name="get_trending_feeds",
-                description="Fetch currently trending or hot crypto news when the user asks what is popular right now. For the next page, pass back the returned cursor unchanged.",
+                description="Fetch currently trending or hot crypto news when the user asks what is popular right now.",
                 args_schema=TrendingFeedsInput,
             ),
             StructuredTool.from_function(
@@ -307,7 +301,7 @@ class FollowinChatAgent:
             StructuredTool.from_function(
                 func=self._tool_search_content,
                 name="search_content",
-                description="Search Followin content for a specific topic, project, narrative, phrase, or question term. For the next page, pass back the returned cursor unchanged.",
+                description="Search Followin content for a specific topic, project, narrative, phrase, or question term.",
                 args_schema=SearchInput,
             ),
             StructuredTool.from_function(
@@ -375,19 +369,14 @@ class FollowinChatAgent:
         self,
         feed_type: str = "hot_news",
         limit: int = 8,
-        cursor: str | None = None,
     ) -> str:
         result = self.mcp_client.call_tool(
             "get_trending_feeds",
-            {"feed_type": feed_type, "limit": limit, "cursor": cursor or ""},
+            {"feed_type": feed_type, "limit": limit},
         )
         if isinstance(result, dict):
             items = result.get("items", [])
-            extra = {
-                key: result.get(key)
-                for key in ("last_cursor", "next_cursor", "cursor", "has_more", "has_next")
-                if key in result
-            }
+            extra = {}
         else:
             items = result
             extra = {}
@@ -396,7 +385,7 @@ class FollowinChatAgent:
         compact = [compact_item(item) for item in items[:limit]]
         return self._record_tool_run(
             "get_trending_feeds",
-            {"feed_type": feed_type, "limit": limit, "cursor": cursor or ""},
+            {"feed_type": feed_type, "limit": limit},
             compact,
             extra=extra,
         )
@@ -466,19 +455,14 @@ class FollowinChatAgent:
         self,
         query: str,
         limit: int = 8,
-        cursor: str | None = None,
     ) -> str:
         result = self.mcp_client.call_tool(
             "search_content",
-            {"query": query, "limit": limit, "cursor": cursor or ""},
+            {"query": query, "limit": limit},
         )
         if isinstance(result, dict):
             items = result.get("items", [])
-            extra = {
-                key: result.get(key)
-                for key in ("last_cursor", "next_cursor", "cursor", "has_more", "has_next")
-                if key in result
-            }
+            extra = {}
         else:
             items = result
             extra = {}
@@ -487,7 +471,7 @@ class FollowinChatAgent:
         compact = [compact_item(item) for item in items[:limit]]
         return self._record_tool_run(
             "search_content",
-            {"query": query, "limit": limit, "cursor": cursor or ""},
+            {"query": query, "limit": limit},
             compact,
             extra=extra,
         )

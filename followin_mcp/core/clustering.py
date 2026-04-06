@@ -6,8 +6,8 @@ from collections import Counter
 from datetime import datetime
 from typing import Callable, Dict, List, Sequence, Set
 
-from .event_types import EventType
 from .models import ContentItem, Entities, EventCluster
+from .taxonomy_rules import EventType
 
 
 class EventClusterer:

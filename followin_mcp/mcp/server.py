@@ -119,17 +119,13 @@ def get_latest_headlines(
 def get_trending_feeds(
     feed_type: str = "hot_news",
     limit: int = 20,
-    cursor: str | None = None,
 ) -> Dict[str, Any]:
     """Get trending normalized feeds for hot or popular crypto news."""
     payload = _build_service().get_trending_feeds(
         feed_type=feed_type,
         limit=limit,
-        cursor=cursor,
     )
-    response = {"items": _items_to_dicts(payload["items"])}
-    response.update(_page_meta(payload, exclude={"items"}))
-    return response
+    return {"items": _items_to_dicts(payload["items"])}
 
 
 @mcp.tool()
@@ -181,17 +177,13 @@ def get_trending_topics(limit: int = 10, cursor: str | None = None) -> Dict[str,
 def search_content(
     query: str,
     limit: int = 20,
-    cursor: str | None = None,
 ) -> Dict[str, Any]:
     """Search normalized content by keyword, project, topic, narrative, or phrase query."""
     payload = _build_service().search_content(
         query=query,
         limit=limit,
-        cursor=cursor,
     )
-    response = {"items": _items_to_dicts(payload["items"])}
-    response.update(_page_meta(payload, exclude={"items"}))
-    return response
+    return {"items": _items_to_dicts(payload["items"])}
 
 
 @mcp.tool()

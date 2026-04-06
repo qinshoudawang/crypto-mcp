@@ -1,8 +1,26 @@
 from __future__ import annotations
 
-from .event_types import EventType
+from enum import StrEnum
+
+class EventType(StrEnum):
+    EXPLOIT = "exploit"
+    GOVERNANCE = "governance"
+    LISTING = "listing"
+    FUNDING = "funding"
+    TOKEN_UNLOCK = "token_unlock"
+    AIRDROP = "airdrop"
+    PARTNERSHIP = "partnership"
+    MERGER = "merger"
+    INCENTIVE_PROGRAM = "incentive_program"
+    MARKET_STRUCTURE = "market_structure"
+    INSTITUTIONAL_ADOPTION = "institutional_adoption"
+    PRODUCT_LAUNCH = "product_launch"
+    MACRO = "macro"
+    UNKNOWN = "unknown"
 
 DEFAULT_DYNAMIC_ALIAS_PATH = "data/candidate_discovery/promoted_aliases.json"
+
+# Base entity vocabulary
 
 CHAIN_KEYWORDS = [
     "solana",
@@ -14,26 +32,6 @@ CHAIN_KEYWORDS = [
     "polygon",
     "bnb chain",
     "avalanche",
-]
-
-TOPIC_KEYWORDS = [
-    "defi",
-    "ai agents",
-    "airdrop",
-    "governance",
-    "exploit",
-    "listing",
-    "funding",
-    "memecoin",
-    "token unlock",
-    "partnership",
-    "merger",
-    "incentive program",
-    "restaking",
-    "stablecoin",
-    "rwa",
-    "derivatives",
-    "layer2",
 ]
 
 TITLE_EVENT_HINTS = {
@@ -97,6 +95,8 @@ ENTITY_ALIASES = {
     "Binance": ["binance"],
 }
 
+# Topic taxonomy
+
 TOPIC_ALIASES = {
     "DeFi": ["defi", "dex", "amm", "yield", "lending", "perp", "perpetual"],
     "AI Agents": ["ai agents", "ai agent", "agent", "autonomous agent"],
@@ -145,6 +145,8 @@ TOPIC_ALIASES = {
     "Layer2": ["layer2", "layer 2", "l2", "rollup", "optimistic rollup"],
 }
 
+# Global content filters
+
 MACRO_KEYWORDS = [
     "fed", "fomc", "powell", "cpi", "ppi", "inflation", "rate cut", "rate hike",
     "nonfarm", "payroll", "tariff", "trade deficit", "treasury", "bond yield",
@@ -157,118 +159,140 @@ NON_CRYPTO_NOISE_KEYWORDS = [
     "embassy", "israel", "iran", "saudi", "missile", "drone", "airstrike", "military",
 ]
 
-MARKET_STRUCTURE_KEYWORDS = [
-    "open interest",
-    "liquidation",
-    "short squeeze",
-    "etf flow",
-    "whale transfer",
-    "funding rate",
-    "清算",
-    "爆仓",
-    "鲸鱼转账",
-    "资金费率",
-]
+# Event scoring
 
-EVENT_TYPE_RULES = [
-    (
-        EventType.EXPLOIT,
-        ["exploit", "hack", "drain", "breach", "攻击", "被盗", "漏洞", "security incident"],
-    ),
-    (
-        EventType.GOVERNANCE,
-        ["proposal", "vote", "governance", "提案", "投票", "治理", "snapshot"],
-    ),
-    (
-        EventType.LISTING,
-        [
-            "listing",
-            "listed",
-            "open trading",
-            "trading starts",
-            "上线交易",
-            "上架交易",
-            "登陆币安",
-            "登陆交易所",
-        ],
-    ),
-    (
-        EventType.FUNDING,
-        [
-            "raise",
-            "funding",
-            "financing",
-            "seed round",
-            "series a",
-            "series b",
-            "strategic round",
-            "融资",
-            "募资",
-        ],
-    ),
-    (
-        EventType.TOKEN_UNLOCK,
-        [
-            "token unlock",
-            "unlocks",
-            "vesting",
-            "cliff",
-            "解锁",
-            "归属",
-        ],
-    ),
-    (
-        EventType.AIRDROP,
-        ["airdrop", "claim", "retroactive", "空投", "领取", "申领"],
-    ),
-    (
-        EventType.PARTNERSHIP,
-        ["partnership", "collaboration", "partnered", "合作", "integrates with", "集成"],
-    ),
-    (
-        EventType.MERGER,
-        ["acquire", "acquisition", "merge", "merger", "收购", "合并"],
-    ),
-    (
-        EventType.INCENTIVE_PROGRAM,
-        [
-            "reward program",
-            "points program",
-            "launchpool",
-            "liquidity incentive",
-            "mining campaign",
-            "积分计划",
-            "激励计划",
-            "流动性激励",
-        ],
-    ),
-    (EventType.MARKET_STRUCTURE, MARKET_STRUCTURE_KEYWORDS),
-]
-
-INSTITUTIONAL_KEYWORDS = [
-    "现货交易", "spot trading", "提供交易", "支持交易", "开放交易",
-    "计划推出", "plans to launch", "considering offering", "考虑推出", "考虑提供",
-]
-
-INSTITUTION_NAMES = [
-    "嘉信理财", "schwab", "fidelity", "blackrock", "coinbase", "binance", "okx",
-]
-
-LAUNCH_KEYWORDS = [
-    "launch", "announced", "release", "mainnet", "推出", "主网上线", "goes live", "live now",
-]
-
-TITLE_MARKET_STRUCTURE_HINTS = ["surge", "rally", "跌破", "突破"]
-
-TOPIC_EVENT_TYPE_MAP = {
-    "Exploit": EventType.EXPLOIT,
-    "Governance": EventType.GOVERNANCE,
-    "Airdrop": EventType.AIRDROP,
-    "Listing": EventType.LISTING,
-    "Funding": EventType.FUNDING,
-    "Token Unlock": EventType.TOKEN_UNLOCK,
-    "Partnership": EventType.PARTNERSHIP,
-    "Merger": EventType.MERGER,
-    "Incentive Program": EventType.INCENTIVE_PROGRAM,
-    "Derivatives": EventType.MARKET_STRUCTURE,
+EVENT_SCORING_CONFIG = {
+    "text_rules": [
+        (
+            EventType.EXPLOIT,
+            ["exploit", "hack", "drain", "breach", "攻击", "被盗", "漏洞", "security incident"],
+        ),
+        (
+            EventType.GOVERNANCE,
+            ["proposal", "vote", "governance", "提案", "投票", "治理", "snapshot"],
+        ),
+        (
+            EventType.LISTING,
+            [
+                "listing",
+                "listed",
+                "open trading",
+                "trading starts",
+                "上线交易",
+                "上架交易",
+                "登陆币安",
+                "登陆交易所",
+            ],
+        ),
+        (
+            EventType.FUNDING,
+            [
+                "raise",
+                "funding",
+                "financing",
+                "seed round",
+                "series a",
+                "series b",
+                "strategic round",
+                "融资",
+                "募资",
+            ],
+        ),
+        (
+            EventType.TOKEN_UNLOCK,
+            [
+                "token unlock",
+                "unlocks",
+                "vesting",
+                "cliff",
+                "解锁",
+                "归属",
+            ],
+        ),
+        (
+            EventType.AIRDROP,
+            ["airdrop", "claim", "retroactive", "空投", "领取", "申领"],
+        ),
+        (
+            EventType.PARTNERSHIP,
+            ["partnership", "collaboration", "partnered", "合作", "integrates with", "集成"],
+        ),
+        (
+            EventType.MERGER,
+            ["acquire", "acquisition", "merge", "merger", "收购", "合并"],
+        ),
+        (
+            EventType.INCENTIVE_PROGRAM,
+            [
+                "reward program",
+                "points program",
+                "launchpool",
+                "liquidity incentive",
+                "mining campaign",
+                "积分计划",
+                "激励计划",
+                "流动性激励",
+            ],
+        ),
+        (
+            EventType.MARKET_STRUCTURE,
+            [
+                "open interest",
+                "liquidation",
+                "short squeeze",
+                "etf flow",
+                "whale transfer",
+                "funding rate",
+                "清算",
+                "爆仓",
+                "鲸鱼转账",
+                "资金费率",
+            ],
+        ),
+    ],
+    "title_hints": {
+        EventType.MARKET_STRUCTURE: ["surge", "rally", "跌破", "突破"],
+    },
+    "topic_event_overrides": {
+        "Derivatives": EventType.MARKET_STRUCTURE,
+    },
+    "context_boosts": {
+        EventType.INSTITUTIONAL_ADOPTION: {
+            "keywords": [
+                "现货交易",
+                "spot trading",
+                "提供交易",
+                "支持交易",
+                "开放交易",
+                "计划推出",
+                "plans to launch",
+                "considering offering",
+                "考虑推出",
+                "考虑提供",
+            ],
+            "required_names": [
+                "嘉信理财",
+                "schwab",
+                "fidelity",
+                "blackrock",
+                "coinbase",
+                "binance",
+                "okx",
+            ],
+            "boost": 0.70,
+        },
+        EventType.PRODUCT_LAUNCH: {
+            "keywords": [
+                "launch",
+                "announced",
+                "release",
+                "mainnet",
+                "推出",
+                "主网上线",
+                "goes live",
+                "live now",
+            ],
+            "boost": 0.55,
+        },
+    },
 }

@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Set
 
-from .event_types import EventType
 from .models import EventCluster, UserProfile
+from .taxonomy_rules import EventType
 
 
 class UserRanker:

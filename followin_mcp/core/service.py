@@ -94,17 +94,13 @@ class FollowinMCPService:
         self,
         feed_type: str = "hot_news",
         limit: int = 20,
-        cursor: str | None = None,
     ) -> Dict[str, Any]:
-        # Followin does not expose cursor metadata for trending feeds, so we
-        # simulate stable pagination over the current snapshot with an offset cursor.
-        fetch_limit = max(limit * 3, 30)
         items = [
             self.normalizer.normalize(item)
-            for item in self.adapter.get_trending_feeds(feed_type=feed_type, limit=fetch_limit)
+            for item in self.adapter.get_trending_feeds(feed_type=feed_type, limit=limit)
         ]
         self.semantic_recall.enqueue_items(items)
-        return self._paginate_sequence(items, limit=limit, cursor=cursor)
+        return {"items": items}
 
     def get_project_feed(
         self,
@@ -150,17 +146,13 @@ class FollowinMCPService:
         self,
         query: str,
         limit: int = 20,
-        cursor: str | None = None,
     ) -> Dict[str, Any]:
-        # Search currently runs over a fresh in-memory snapshot, so pagination is
-        # also offset-based until the upstream API exposes a real cursor.
-        fetch_limit = max(limit * 3, 30)
         items = [
             self.normalizer.normalize(item)
-            for item in self.adapter.search_content(query=query, limit=fetch_limit)
+            for item in self.adapter.search_content(query=query, limit=limit)
         ]
         self.semantic_recall.enqueue_items(items)
-        return self._paginate_sequence(items, limit=limit, cursor=cursor)
+        return {"items": items}
 
     def get_trending_topics(
         self,
@@ -180,21 +172,17 @@ class FollowinMCPService:
     ) -> Dict[str, Any]:
         # This is the public feed façade used by MCP tools. Keep it thin and let
         # the private pipeline own the internal stage orchestration.
-        session = self._get_or_create_feed_session(user=user, query=query, cursor=cursor)
-        effective_query = session.query if cursor and session.query is not None else query
-        target_buffer_size = max(max_items, self._feed_snapshot_buffer_size)
-        refill_threshold = max(max_items, self._feed_snapshot_refill_threshold)
-        pending_before = len(session.pending_clusters)
-        logger.info(
-            "[feed] request: session_id=%s incoming_cursor=%s effective_query=%r max_items=%s pending_before=%s delivered_events=%s refill_threshold=%s target_buffer=%s",
-            session.session_id,
-            cursor or "",
-            (effective_query or "").strip()[:80],
-            max_items,
-            pending_before,
-            len(session.delivered_event_ids),
+        (
+            session,
+            effective_query,
             refill_threshold,
             target_buffer_size,
+            pending_before,
+        ) = self._prepare_feed_session_request(
+            user=user,
+            query=query,
+            cursor=cursor,
+            max_items=max_items,
         )
         has_more_sources = False
         if pending_before < refill_threshold:
@@ -212,18 +200,11 @@ class FollowinMCPService:
                 refill_threshold,
             )
 
-        page_clusters: List[EventCluster] = []
-        with self._feed_session_lock:
-            while session.pending_clusters and len(page_clusters) < max_items:
-                page_clusters.append(session.pending_clusters.pop(0))
-
-        ranked_items = [item for cluster in page_clusters for item in cluster.items]
-        with self._feed_session_lock:
-            session.delivered_event_ids.update(cluster.event_id for cluster in page_clusters)
-            session.delivered_item_ids.update(item.id for item in ranked_items)
-            session.updated_at = time.time()
-            has_more = bool(session.pending_clusters) or has_more_sources
-            pending_after = len(session.pending_clusters)
+        page_clusters, ranked_items, has_more, pending_after = self._emit_feed_page(
+            session=session,
+            max_items=max_items,
+            has_more_sources=has_more_sources,
+        )
         logger.info(
             "[feed] page emitted: session_id=%s clusters=%s items=%s pending_after=%s has_more=%s",
             session.session_id,
@@ -238,6 +219,51 @@ class FollowinMCPService:
             "has_more": has_more,
             **({"next_cursor": session.session_id} if has_more else {}),
         }
+
+    def _prepare_feed_session_request(
+        self,
+        user: UserProfile,
+        query: str | None,
+        cursor: str | None,
+        max_items: int,
+    ) -> Tuple[FeedSessionState, str | None, int, int, int]:
+        session = self._get_or_create_feed_session(user=user, query=query, cursor=cursor)
+        effective_query = session.query if cursor and session.query is not None else query
+        target_buffer_size = max(max_items, self._feed_snapshot_buffer_size)
+        refill_threshold = max(max_items, self._feed_snapshot_refill_threshold)
+        pending_before = len(session.pending_clusters)
+        logger.info(
+            "[feed] request: session_id=%s incoming_cursor=%s effective_query=%r max_items=%s pending_before=%s delivered_events=%s refill_threshold=%s target_buffer=%s",
+            session.session_id,
+            cursor or "",
+            (effective_query or "").strip()[:80],
+            max_items,
+            pending_before,
+            len(session.delivered_event_ids),
+            refill_threshold,
+            target_buffer_size,
+        )
+        return session, effective_query, refill_threshold, target_buffer_size, pending_before
+
+    def _emit_feed_page(
+        self,
+        session: FeedSessionState,
+        max_items: int,
+        has_more_sources: bool,
+    ) -> Tuple[List[EventCluster], List[ContentItem], bool, int]:
+        page_clusters: List[EventCluster] = []
+        with self._feed_session_lock:
+            while session.pending_clusters and len(page_clusters) < max_items:
+                page_clusters.append(session.pending_clusters.pop(0))
+
+        ranked_items = [item for cluster in page_clusters for item in cluster.items]
+        with self._feed_session_lock:
+            session.delivered_event_ids.update(cluster.event_id for cluster in page_clusters)
+            session.delivered_item_ids.update(item.id for item in ranked_items)
+            session.updated_at = time.time()
+            has_more = bool(session.pending_clusters) or has_more_sources
+            pending_after = len(session.pending_clusters)
+        return page_clusters, ranked_items, has_more, pending_after
 
     def _fill_feed_snapshot_buffer(
         self,
@@ -369,7 +395,6 @@ class FollowinMCPService:
         trending_page = self.get_trending_feeds(
             feed_type="hot_news",
             limit=trending_limit,
-            cursor=cursor_state.get("trending") or None,
         )
         candidates.extend(trending_page["items"])
 
@@ -391,7 +416,6 @@ class FollowinMCPService:
                     self.search_content(
                         query=interest,
                         limit=per_interest_limit,
-                        cursor=cursor_state.get("search") or None,
                     )["items"]
                 )
             except Exception:
@@ -422,9 +446,7 @@ class FollowinMCPService:
             key: value
             for key, value in {
                 "latest": latest_page.get("next_cursor"),
-                "trending": trending_page.get("next_cursor"),
                 "project": cursor_state.get("project"),
-                "search": cursor_state.get("search"),
             }.items()
             if value
         }
@@ -500,35 +522,6 @@ class FollowinMCPService:
             return candidate.importance_score > current.importance_score
 
         return candidate.published_at > current.published_at
-
-    def _paginate_sequence(
-        self,
-        items: Sequence[T],
-        limit: int,
-        cursor: str | None = None,
-    ) -> Dict[str, Any]:
-        size = max(1, limit)
-        offset = self._decode_offset_cursor(cursor)
-        page_items = list(items[offset : offset + size])
-        next_offset = offset + len(page_items)
-        has_more = next_offset < len(items)
-        payload: Dict[str, Any] = {
-            "items": page_items,
-            "cursor": str(offset),
-            "has_more": has_more,
-            "has_next": has_more,
-        }
-        if has_more:
-            payload["next_cursor"] = str(next_offset)
-        return payload
-
-    def _decode_offset_cursor(self, cursor: str | None) -> int:
-        if not cursor:
-            return 0
-        try:
-            return max(0, int(cursor))
-        except (TypeError, ValueError):
-            return 0
 
     def _get_or_create_feed_session(
         self,

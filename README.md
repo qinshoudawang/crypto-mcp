@@ -1,12 +1,18 @@
-# followin-mcp
+# Followin-MCP
 
-一个面向 crypto 场景的 Followin MCP 原型，当前重点是：
+## 项目概览
 
-- 内容归一化
-- 事件聚类
-- 用户个性化推荐排序
-- 推荐解释与调试
-- 语义召回与异步 embedding 索引
+这个项目可以理解成一条面向 crypto 资讯场景的事件级推荐原型：
+
+- 上游通过 `Followin API + adapters.py` 拉取原始内容
+- `normalizer.py` 把原始内容标准化成结构化 `ContentItem`
+- `service.py` 在 `get_personal_feed` 里先做显式多路召回，再做 semantic supplement
+- `clustering.py` 把多条内容并成同一事件的 `EventCluster`
+- `ranking.py` 用多信号 heuristic ranker + MMR rerank 生成个性化 feed
+
+一句话总结：
+
+> 一个面向 crypto 资讯场景的 Followin MCP 原型：将原始内容标准化成结构化 item，再通过多路召回、语义补召回、事件聚类和个性化排序，产出面向用户的事件级 feed。
 
 ## 目录结构
 
@@ -18,8 +24,6 @@
   MCP server 入口
 - `followin_mcp/demo/`
   测试 agent 和 Web demo
-- `scripts/debug_recommendation.py`
-  推荐调试脚本
 - `scripts/start_dev.sh`
   本地一键启动脚本
 - `web/`
@@ -33,8 +37,6 @@
   数据模型
 - `followin_mcp/core/taxonomy_rules.py`
   taxonomy / 规则配置
-- `followin_mcp/core/event_types.py`
-  事件类型枚举
 - `followin_mcp/core/normalizer.py`
   原始内容标准化、实体抽取、事件类型识别
 - `followin_mcp/core/clustering.py`
@@ -46,100 +48,124 @@
 - `followin_mcp/core/service.py`
   面向 MCP / 应用层的服务入口
 
-## 架构总览
+## 请求处理时序
 
 ```mermaid
-flowchart TD
-    A[Followin API / MCP Tool Request] --> B[adapters.py]
-    B --> C[normalizer.py]
-    C --> C1[实体抽取\n规则/alias/tag]
-    C --> C2[事件分类\n多信号 scoring]
-    C --> C3[内容打分\nimportance/credibility]
+sequenceDiagram
+    participant U as MCP client / agent
+    participant M as mcp/server.py
+    participant S as service.py
+    participant A as adapters.py
+    participant F as Followin API
+    participant N as normalizer.py
+    participant SR as semantic_recall.py
+    participant C as clustering.py
+    participant R as ranking.py
 
-    C --> D[service.py]
-    D --> D1[显式召回\nlatest/trending/project/search]
-    D --> D2[semantic_recall.py\nquery-aware semantic recall]
+    U->>M: call tool
+    M->>S: get_latest / search / get_personal_feed ...
 
-    D2 --> D21[异步 embedding worker]
-    D2 --> D22[SQLite semantic_index.db]
-    D21 --> D22
+    S->>A: fetch raw content
+    A->>F: HTTP request
+    F-->>A: raw payload
+    A-->>S: raw items
 
-    D --> E[clustering.py]
-    E --> E1[时间窗口]
-    E --> E2[confidence-aware entity overlap]
-    E --> E3[title similarity]
-    E --> E4[item embedding similarity]
+    loop per raw item
+        S->>N: normalize(raw)
+        N-->>S: ContentItem\nentities / event_type / scores
+    end
 
-    E --> F[ranking.py]
-    F --> F1[importance]
-    F --> F2[freshness]
-    F --> F3[follow / interest]
-    F --> F4[semantic match]
-    F --> F5[source quality]
-    F --> F6[MMR diversification rerank]
+    S->>SR: enqueue normalized items
+    SR-->>S: background indexing
 
-    F --> F7[feed session buffer\npending_clusters]
+    opt personal feed / semantic supplement
+        S->>SR: recall(query, candidate pool)
+        SR-->>S: semantic candidates / similarity
+    end
 
-    F --> G[mcp/server.py]
-    G --> H[get_personal_feed / latest / search / topics]
+    opt personal feed
+        S->>C: cluster_same_event(items)
+        Note over C: uses item embedding similarity
+        C-->>S: EventCluster list
+        S->>R: rank_for_user(user, clusters)
+        Note over R: uses semantic_match_score
+        R-->>S: ranked clusters
+    end
+
+    S-->>M: tool payload
+    M-->>U: MCP response
 ```
-
-## 面试版摘要
-
-这个项目可以概括成一条面向 crypto 资讯场景的轻量推荐链路：
-
-- 上游通过 `Followin API + normalizer` 把原始内容标准化成结构化 item
-- 中间通过 `explicit recall + semantic recall` 构建候选集
-- 再通过 `multi-signal clustering` 把多篇内容并成事件簇
-- 最后通过 `personalized ranking + MMR rerank` 生成用户级 feed
-
-如果要一句话描述实现重点，可以这样讲：
-
-> 我做了一个面向 crypto 资讯的事件级推荐原型，在线侧用规则和动态词典做低延迟内容理解，召回侧引入 query-aware embedding semantic recall，聚类侧融合时间、实体重叠和语义相似度，排序侧用多信号 heuristic ranker 加 MMR diversification 产出个性化 feed。
-
-如果要一句话描述与生产的距离，可以这样讲：
-
-> 当前实现已经覆盖了内容理解、召回、聚类、排序和解释的完整链路，但用户建模、learned ranking、cluster lifecycle 和 source reliability calibration 仍然是后续向生产演进的主要方向。
 
 ## 处理链路
 
-### 1. 内容理解层
+### 1. MCP 入口
+
+- `mcp/server.py`
+  - 暴露 7 个 MCP tools
+  - 把 MCP 入参转成 `service.py` 调用
+  - 负责把 `ContentItem / EventCluster` 序列化成 MCP 返回结构
+
+### 2. 原始内容获取
+
+- `service.py -> adapters.py`
+  - `get_latest_headlines / get_project_feed / get_project_opinions / get_trending_topics`
+    直接透传上游分页能力
+  - `get_trending_feeds / search_content`
+    直接返回当前快照结果
+  - `get_personal_feed`
+    会先做显式多路召回和 semantic supplement，再走事件聚类和个性化排序
+
+### 3. 内容标准化
 
 - `normalizer.py`
-  - 基于 `tag + builtin alias + dynamic alias + keyword rules` 做实体抽取
-  - 产出 `projects / tokens / chains / topics`
-  - 产出 `entity_sources` 与 `entity_confidence`
-  - 基于 `topic prior + lexical triggers + entity boosters` 做 event type scoring
-  - 产出 `importance_score` 与 `credibility_score`
+  - `normalize(raw)` 把单条原始内容转成 `ContentItem`
+  - 实体抽取来源：
+    - tag
+    - chain keyword
+    - project alias
+    - token alias
+    - topic alias
+    - dynamic alias（轻量化实体发现 / 旁路NER）
+  - 产出：
+    - `projects / tokens / chains / topics`
+    - `entity_sources`
+    - `entity_confidence(命中方式强度)`
+    - `event_type`
+    - `credibility_score(来源可信程度)`
+    - `importance_score(预定规则计算)`
 
-### 2. 召回层
+### 4. 召回
 
-- 显式召回
-  - `latest headlines`
-  - `trending feeds`
-  - `project feed`
-  - `search content`
-- 语义召回
-  - `semantic_recall.py`
-  - 使用 `user profile + current query` 构造 query embedding
-  - 候选 item embedding 存到 SQLite
-  - 服务启动 warmup + 运行时增量 enqueue
+- 这里的“召回”指的是：
+  - 先从更大的内容池里取出一批候选 `ContentItem`
+  - 供后面的聚类、排序和分页使用
+- `service.py` 在 personal feed 里会先做显式多路召回：
+  - `latest`
+  - `trending`
+  - `project`
+  - `search`
+- 多路召回结果会先按 `item.id` 去重
+  - 同一个 item 如果被多路命中，会优先保留 semantic match 更强、importance 更高、更新时间更近的那个版本
 
-### 3. 聚类层
+### 5. 事件聚类
 
 - `clustering.py`
-  - greedy incremental clustering
-  - 先做 `event_type` 和时间窗口 gating
-  - 再用多信号 cluster score 合并：
-    - confidence-aware entity overlap
-    - title Jaccard similarity
-    - optional semantic similarity
+  - 输入是 `ContentItem` 列表
+  - 输出是 `EventCluster` 列表
+  - 聚类目标是“同一事件”，不是同一项目或同一 topic
+  - 主要信号：
+    - 事件类型兼容性
+    - 时间窗口
+    - 带置信度权重的实体重叠
+    - 标题相似度
+    - 可选的语义相似度
 
-### 4. 排序层
+### 6. 个性化排序
 
 - `ranking.py`
-  - cluster 级个性化排序
-  - 使用的信号包括：
+  - 输入是 `EventCluster`
+  - 输出是按用户排序后的 cluster feed
+  - 主要信号：
     - `importance_score`
     - `freshness_score`
     - `follow_affinity_score`
@@ -147,76 +173,93 @@ flowchart TD
     - `semantic_match_score`
     - `source_quality_score`
     - `risk_boost_score`
-    - `mute_penalty`
-  - 最后用 MMR 风格 rerank 做 diversification
+  - `mute_penalty`
+  - 最后再做一层 MMR-style diversification rerank
+
+### 7. Embedding
+
+- `semantic_recall.py`
+  - normalized item 会先 `enqueue` 到异步 embedding worker
+  - item embedding 存在本地 SQLite `semantic_index.db`
+- embedding 当前主要参与三件事：
+  - `service.py` 在 personal feed 里基于当前 query 和候选池做 query-aware semantic recall / semantic supplement
+  - `clustering.py` 把 item embedding similarity 作为聚类信号之一
+  - `ranking.py` 通过 `semantic_match_score` 把语义匹配信号带入最终排序
+
+## Personal Feed
+
+- `get_personal_feed` 是当前唯一会话化的 feed tool
+- 主流程是：
+  - 显式多路召回
+  - semantic supplement
+  - 事件聚类
+  - 个性化排序
+- `service.py` 内部维护 `FeedSessionState`，主要保存：
+  - `pending_clusters`
+  - `delivered_event_ids`
+  - `delivered_item_ids`
+  - `source_cursors`
+- 返回结果包含：
+  - `ranked_clusters`
+  - 展开的 supporting `items`
+  - `next_cursor`
+  - `has_more`
+- 分页语义是：
+  - 首次请求创建 feed session，并尽量把已排好序的 cluster 填进 `pending_clusters`
+  - 当前页从 `pending_clusters` 头部取前 `max_items` 个 cluster
+  - 已返回的 cluster / item 会记入 delivered 集合，避免后续重复
+  - 后续“更多”优先继续消费剩余 `pending_clusters`
+  - 当 buffer 低于 refill threshold 时，再触发下一轮召回、semantic supplement、聚类和排序来补 buffer
 
 ## Tool 语义与上下文边界
 
-大多数 MCP tools 默认保持**无状态**：
+当前这套 MCP tools 可以分成两类：
 
-- `get_latest_headlines`
-- `get_trending_feeds`
-- `get_project_feed`
-- `get_project_opinions`
-- `get_trending_topics`
-- `search_content`
-
-这些 tool 会返回“当前时刻的原始结果”或“当前排序结果”，但**不会自动根据对话历史做去重、翻页或续看控制**。
-
-`get_personal_feed` 是当前唯一的例外：
-
-- 它会在 `service.py` 内维护一个短生命周期的 **feed session**
-- 对外暴露的是一个轻量的 **feed session cursor**
-- 服务端内部保存：
-  - `source_cursors`
-  - `delivered_event_ids`
-  - `delivered_item_ids`
-  - `pending_clusters`
-- 后续“更多”请求会优先消费 session 里的 `pending_clusters`，更接近推荐流 continuation，而不是单纯的 offset 切页
-
-对应的职责边界是：
-
-- tool / service 层
-  - 提供原始 retrieval / ranking 能力
-  - 不隐式维护 session-level seen state
-- agent 层
-  - 负责利用对话历史和已有 tool 输出做多轮控制
-  - 例如：
-    - “展开刚才第二条”
-    - “继续讲上一条”
-    - “再来一批”
-    - “换一批别重复的”
-
-这样设计的原因是：
-
-- 避免 tool 层把“推荐曝光控制”和“原始查询能力”混在一起
-- 避免用户想继续分析上一轮结果时，被 session 级硬去重错误拦住
-- 让多轮对话策略明确落在 agent policy，而不是埋在底层 service 里
-
-当前分页语义如下：
-
-- 已经暴露 cursor 的 tool：
+- 内容查询工具
   - `get_latest_headlines`
   - `get_trending_feeds`
   - `get_project_feed`
   - `get_project_opinions`
   - `get_trending_topics`
   - `search_content`
+- 推荐工具
   - `get_personal_feed`
-- 这些 tool 的返回里会带上可用的分页元信息，例如：
-  - `cursor`
-  - `next_cursor`
-  - `last_cursor`
-  - `has_more`
-  - `has_next`
-- agent 目前已经通过 prompt 明确承担上下文控制职责，可以在用户要求“更多 / 下一页”时复用这些 cursor
-- 其中：
-  - `get_latest_headlines / get_project_feed / get_project_opinions / get_trending_topics`
-    优先透传上游 API 的真实 cursor
-  - `get_trending_feeds / search_content`
-    目前使用服务层 offset-cursor，对当前快照做稳定分页
-  - `get_personal_feed`
-    当前使用 feed session cursor；服务端会维护 `pending_clusters` 作为 snapshot-like queue，后续分页优先从 buffer 中返回，再按需补充新的候选与排序结果
+
+内容查询工具默认保持无状态：
+
+- `get_latest_headlines / get_project_feed / get_project_opinions / get_trending_topics`
+  - 透传上游分页能力
+  - 返回的是当前请求对应的一页结果
+- `get_trending_feeds / search_content`
+  - 直接返回当前快照结果
+  - 不维护额外的服务层分页状态
+
+`get_personal_feed` 是当前唯一的状态化 tool：
+
+- `service.py` 会维护短生命周期的 `FeedSessionState`
+- 对外只暴露 `feed session cursor`
+- 服务端内部保存：
+  - `pending_clusters`
+  - `delivered_event_ids`
+  - `delivered_item_ids`
+  - `source_cursors`
+- 后续“更多”会优先继续消费 session 里的 `pending_clusters`
+
+职责边界大致是：
+
+- tool / service 层
+  - 提供内容获取、候选召回、聚类、排序和 feed session 管理
+- agent 层
+  - 负责多轮对话中的工具选择和上下文承接
+  - 例如继续上一批、展开上一条、基于上一轮结果追问
+
+当前分页语义：
+
+- `get_latest_headlines / get_project_feed / get_project_opinions / get_trending_topics`
+  - 返回上游原生 cursor 元信息
+- `get_personal_feed`
+  - 返回 `next_cursor` 和 `has_more`
+  - `cursor` 的语义是 feed session continuation，而不是普通列表翻页
 
 ## 当前使用到的技术 / 算法
 
@@ -243,33 +286,29 @@ flowchart TD
   - heuristic linear ranker
   - MMR-style diversification rerank
 
-## 与业界生产实现相比，还缺什么
+## 与业界生产实现相比，原型还缺什么
 
-### 召回 / 用户建模
+### 召回 / 推荐系统能力
 
-- 还没有真正的 long-term / session user representation 分层
-- 还没有行为日志驱动的异步用户画像更新
-- 语义召回仍以单机 SQLite 为主，未接入专门向量库或 ANN 检索
-- cursor / pagination 已经统一暴露到 MCP tools，但部分工具仍是服务层 offset-cursor，而不是上游 API 原生 cursor；`get_personal_feed` 虽然已经引入 feed session 与 `pending_clusters` buffer，但仍是内存态的轻量实现，距离生产常见的 Redis / snapshot store 方案还有差距
+- 推荐层还没有真正的 long-term / session user representation 分层
+- 还没有行为日志驱动的异步用户画像更新链路
 
 ### 内容理解
 
-- 实体抽取仍以规则和词典为主，缺少在线 NER / entity linking 主链路
+- 当前已经有轻量化的实体发现 / 弱 NER（tag、alias、rule、LLM-assisted extraction），但还没有带 span offset 的通用在线 NER / entity linking 主链路
 - event taxonomy 仍偏冷启动规则系统，缺少标注数据驱动的校准
-- credibility 仍是 source-type prior，缺少 source-level reliability 和 multi-source verification
+- 当前 `credibility_score` 主要依赖上游提供的 source type / metadata；受数据边界限制，还没有更细的 source-level reliability 和 multi-source verification
 
 ### 聚类
 
-- 当前是轻量多信号聚类，缺少更成熟的 online cluster assignment / pairwise classifier
-- semantic similarity 已接入，但仍是启发式融合，缺少学习到的 merge model
-- cluster 生命周期治理还较弱，缺少跨天演化、拆簇、合簇策略
+- 当前已经把 embedding similarity 作为聚类信号之一，但整体仍是启发式多信号聚类，还没有训练式的 pairwise classifier / merge model
+- 如果进一步演进到基于持久化 cluster store 的在线聚类体系，还需要补 cluster assignment，以及跨天演化、拆簇、合簇等 cluster lifecycle 能力
 
 ### 排序
 
-- 当前是 heuristic linear ranker，不是 learned-to-rank
-- 缺少点击、停留时长、分享等行为特征
-- 缺少线上 A/B 实验与 weight calibration
-- diversification 目前是轻量 MMR，还缺更系统的配额控制和业务约束
+- 当前排序已经用到 embedding 驱动的 `semantic_match_score`，但主体仍是人工特征加权的 heuristic linear ranker，而不是 learned-to-rank
+- 推荐层还没有接入点击、停留时长、分享等行为特征
+- 推荐层当前只做了轻量 MMR diversification，还没有更系统的配额控制和业务约束
 
 ## 当前暴露的 MCP Tools
 
@@ -280,12 +319,6 @@ flowchart TD
 - `get_trending_topics`
 - `search_content`
 - `get_personal_feed`
-
-## 运行调试脚本
-
-```bash
-python3 scripts/debug_recommendation.py
-```
 
 ## Web Demo
 

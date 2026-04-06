@@ -8,33 +8,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .event_types import EventType
 from .models import ContentItem, Entities
 from .taxonomy_rules import (
+    EventType,
     CHAIN_KEYWORDS,
     DEFAULT_DYNAMIC_ALIAS_PATH,
     ENTITY_ALIASES,
-    EVENT_TYPE_RULES,
-    INSTITUTIONAL_KEYWORDS,
-    INSTITUTION_NAMES,
-    LAUNCH_KEYWORDS,
+    EVENT_SCORING_CONFIG,
     MACRO_KEYWORDS,
-    MARKET_STRUCTURE_KEYWORDS,
     NON_CRYPTO_NOISE_KEYWORDS,
     TITLE_EVENT_HINTS,
-    TITLE_MARKET_STRUCTURE_HINTS,
     TOKEN_ALIASES,
     TOPIC_ALIASES,
-    TOPIC_EVENT_TYPE_MAP,
-    TOPIC_KEYWORDS,
 )
 
 
 class ContentNormalizer:
     DEFAULT_DYNAMIC_ALIAS_PATH = DEFAULT_DYNAMIC_ALIAS_PATH
     CHAIN_KEYWORDS = CHAIN_KEYWORDS
-    TOPIC_KEYWORDS = TOPIC_KEYWORDS
     TITLE_EVENT_HINTS = TITLE_EVENT_HINTS
+    EVENT_SCORING_CONFIG = EVENT_SCORING_CONFIG
     TOKEN_ALIASES = TOKEN_ALIASES
     ENTITY_ALIASES = ENTITY_ALIASES
     TOPIC_ALIASES = TOPIC_ALIASES
@@ -43,8 +36,11 @@ class ContentNormalizer:
 
     def __init__(self, dynamic_alias_path: str | None = None) -> None:
         self.chain_keywords = list(self.CHAIN_KEYWORDS)
-        self.topic_keywords = list(self.TOPIC_KEYWORDS)
         self.title_event_hints = dict(self.TITLE_EVENT_HINTS)
+        self.event_type_rules = list(self.EVENT_SCORING_CONFIG["text_rules"])
+        self.event_type_title_hints = dict(self.EVENT_SCORING_CONFIG["title_hints"])
+        self.event_type_topic_overrides = dict(self.EVENT_SCORING_CONFIG["topic_event_overrides"])
+        self.event_type_context_boosts = dict(self.EVENT_SCORING_CONFIG["context_boosts"])
         self.token_aliases = {key: list(value) for key, value in self.TOKEN_ALIASES.items()}
         self.entity_aliases = {key: list(value) for key, value in self.ENTITY_ALIASES.items()}
         self.topic_aliases = {key: list(value) for key, value in self.TOPIC_ALIASES.items()}
@@ -102,117 +98,140 @@ class ContentNormalizer:
             "people": {},
         }
 
-        tags = raw.get("tags", [])
-        for tag in tags:
-            if not isinstance(tag, dict):
-                continue
-            tag_type = (tag.get("type") or "").lower()
-            name = (tag.get("name") or "").strip()
-            symbol = (tag.get("symbol") or "").strip()
-            if tag_type == "token":
-                if name:
-                    entities.projects.append(name)
-                    self._record_entity_source(entity_sources, "projects", name, "tag:name")
-                if symbol:
-                    entities.tokens.append(symbol.upper())
-                    self._record_entity_source(entity_sources, "tokens", symbol.upper(), "tag:symbol")
-
         title_text = item.title.lower()
         body_text = item.content.lower()
         full_text = f"{title_text} {body_text}".strip()
 
+        self._extract_tag_entities(raw, entities, entity_sources)
+        self._extract_chain_entities(title_text, body_text, entities, entity_sources)
+        self._extract_project_alias_entities(title_text, body_text, entities, entity_sources)
+        self._extract_token_alias_entities(title_text, body_text, entities, entity_sources)
+        self._extract_topic_alias_entities(title_text, body_text, full_text, entities, entity_sources)
+
+        self._finalize_entities(entities)
+        item.entity_sources = self._finalize_entity_evidence(entity_sources)
+        item.entity_confidence = self._build_entity_confidence(item.entity_sources)
+        return entities
+
+    def _extract_tag_entities(
+        self,
+        raw: Dict[str, Any],
+        entities: Entities,
+        entity_sources: Dict[str, Dict[str, List[str]]],
+    ) -> None:
+        for tag in raw.get("tags", []):
+            if not isinstance(tag, dict):
+                continue
+            tag_type = (tag.get("type") or "").lower()
+            if tag_type != "token":
+                continue
+
+            name = (tag.get("name") or "").strip()
+            symbol = (tag.get("symbol") or "").strip()
+            if name:
+                entities.projects.append(name)
+                self._record_entity_source(entity_sources, "projects", name, "tag:name")
+            if symbol:
+                normalized_symbol = symbol.upper()
+                entities.tokens.append(normalized_symbol)
+                self._record_entity_source(entity_sources, "tokens", normalized_symbol, "tag:symbol")
+
+    def _extract_chain_entities(
+        self,
+        title_text: str,
+        body_text: str,
+        entities: Entities,
+        entity_sources: Dict[str, Dict[str, List[str]]],
+    ) -> None:
         for chain in self.chain_keywords:
             title_hit = self._contains_alias(title_text, chain)
             body_hit = self._contains_alias(body_text, chain)
-            if title_hit or body_hit:
-                normalized_chain = chain.title()
-                entities.chains.append(normalized_chain)
-                if title_hit:
-                    self._record_entity_source(
-                        entity_sources, "chains", normalized_chain, f"title:{chain}"
-                    )
-                if body_hit:
-                    self._record_entity_source(
-                        entity_sources, "chains", normalized_chain, f"body:{chain}"
-                    )
+            if not (title_hit or body_hit):
+                continue
 
-        for topic in self.topic_keywords:
-            title_hit = self._contains_topic_alias(title_text, topic)
-            body_hit = self._contains_topic_alias(body_text, topic)
-            if title_hit or body_hit:
-                normalized_topic = self._title_case_topic(topic)
-                entities.topics.append(normalized_topic)
-                if title_hit:
-                    self._record_entity_source(
-                        entity_sources, "topics", normalized_topic, f"title:{topic}"
-                    )
-                if body_hit:
-                    self._record_entity_source(
-                        entity_sources, "topics", normalized_topic, f"body:{topic}"
-                    )
+            normalized_chain = chain.title()
+            entities.chains.append(normalized_chain)
+            if title_hit:
+                self._record_entity_source(entity_sources, "chains", normalized_chain, f"title:{chain}")
+            if body_hit:
+                self._record_entity_source(entity_sources, "chains", normalized_chain, f"body:{chain}")
 
+    def _extract_project_alias_entities(
+        self,
+        title_text: str,
+        body_text: str,
+        entities: Entities,
+        entity_sources: Dict[str, Dict[str, List[str]]],
+    ) -> None:
         for canonical_name, aliases in self.entity_aliases.items():
             matched_aliases = [
                 alias
                 for alias in aliases
                 if self._contains_alias(title_text, alias) or self._contains_alias(body_text, alias)
             ]
-            if matched_aliases:
-                entities.projects.append(canonical_name)
-                for alias in matched_aliases:
-                    if self._contains_alias(title_text, alias):
-                        self._record_entity_source(
-                            entity_sources, "projects", canonical_name, f"title:{alias}"
-                        )
-                    if self._contains_alias(body_text, alias):
-                        self._record_entity_source(
-                            entity_sources, "projects", canonical_name, f"body:{alias}"
-                        )
+            if not matched_aliases:
+                continue
 
+            entities.projects.append(canonical_name)
+            for alias in matched_aliases:
+                if self._contains_alias(title_text, alias):
+                    self._record_entity_source(entity_sources, "projects", canonical_name, f"title:{alias}")
+                if self._contains_alias(body_text, alias):
+                    self._record_entity_source(entity_sources, "projects", canonical_name, f"body:{alias}")
+
+    def _extract_token_alias_entities(
+        self,
+        title_text: str,
+        body_text: str,
+        entities: Entities,
+        entity_sources: Dict[str, Dict[str, List[str]]],
+    ) -> None:
         for symbol, aliases in self.token_aliases.items():
             matched_aliases = [
                 alias
                 for alias in aliases
                 if self._contains_alias(title_text, alias) or self._contains_alias(body_text, alias)
             ]
-            if matched_aliases:
-                entities.tokens.append(symbol)
-                for alias in matched_aliases:
-                    if self._contains_alias(title_text, alias):
-                        self._record_entity_source(
-                            entity_sources, "tokens", symbol, f"title:{alias}"
-                        )
-                    if self._contains_alias(body_text, alias):
-                        self._record_entity_source(
-                            entity_sources, "tokens", symbol, f"body:{alias}"
-                        )
+            if not matched_aliases:
+                continue
 
+            entities.tokens.append(symbol)
+            for alias in matched_aliases:
+                if self._contains_alias(title_text, alias):
+                    self._record_entity_source(entity_sources, "tokens", symbol, f"title:{alias}")
+                if self._contains_alias(body_text, alias):
+                    self._record_entity_source(entity_sources, "tokens", symbol, f"body:{alias}")
+
+    def _extract_topic_alias_entities(
+        self,
+        title_text: str,
+        body_text: str,
+        full_text: str,
+        entities: Entities,
+        entity_sources: Dict[str, Dict[str, List[str]]],
+    ) -> None:
         for canonical_topic, aliases in self.topic_aliases.items():
             matched_aliases = [
                 alias
                 for alias in aliases
                 if self._contains_topic_alias(full_text, alias)
             ]
-            if matched_aliases:
-                entities.topics.append(canonical_topic)
-                for alias in matched_aliases:
-                    if self._contains_topic_alias(title_text, alias):
-                        self._record_entity_source(
-                            entity_sources, "topics", canonical_topic, f"title:{alias}"
-                        )
-                    if self._contains_topic_alias(body_text, alias):
-                        self._record_entity_source(
-                            entity_sources, "topics", canonical_topic, f"body:{alias}"
-                        )
+            if not matched_aliases:
+                continue
 
+            entities.topics.append(canonical_topic)
+            for alias in matched_aliases:
+                if self._contains_topic_alias(title_text, alias):
+                    self._record_entity_source(entity_sources, "topics", canonical_topic, f"title:{alias}")
+                if self._contains_topic_alias(body_text, alias):
+                    self._record_entity_source(entity_sources, "topics", canonical_topic, f"body:{alias}")
+
+    def _finalize_entities(self, entities: Entities) -> None:
         entities.projects = self._dedupe_preserve_order(entities.projects)
         entities.tokens = self._dedupe_preserve_order(entities.tokens)
         entities.chains = self._dedupe_preserve_order(entities.chains)
-        entities.topics = self._dedupe_preserve_order(self._normalize_topics(entities.topics))
+        entities.topics = self._dedupe_preserve_order(entities.topics)
         entities.people = list(dict.fromkeys(entities.people))
-        item.entity_sources = self._normalize_entity_sources(entity_sources)
-        item.entity_confidence = self._build_entity_confidence(item.entity_sources)
-        return entities
 
     def classify_event_type(self, item: ContentItem) -> EventType:
         text = f"{item.title} {item.content}".lower()
@@ -365,55 +384,6 @@ class ContentNormalizer:
         ]
         return any(re.search(pattern, text) is not None for pattern in guarded_patterns)
 
-    def _normalize_topics(self, topics: List[str]) -> List[str]:
-        normalized: List[str] = []
-        for topic in topics:
-            key = topic.lower().strip()
-            if key == "defi":
-                normalized.append("DeFi")
-            elif key == "ai agents":
-                normalized.append("AI Agents")
-            elif key == "nft":
-                normalized.append("NFT")
-            elif key == "governance":
-                normalized.append("Governance")
-            elif key == "airdrop":
-                normalized.append("Airdrop")
-            elif key == "exploit":
-                normalized.append("Exploit")
-            elif key == "listing":
-                normalized.append("Listing")
-            elif key == "funding":
-                normalized.append("Funding")
-            elif key == "memecoin":
-                normalized.append("Memecoin")
-            elif key == "token unlock":
-                normalized.append("Token Unlock")
-            elif key == "partnership":
-                normalized.append("Partnership")
-            elif key == "merger":
-                normalized.append("Merger")
-            elif key == "incentive program":
-                normalized.append("Incentive Program")
-            elif key == "restaking":
-                normalized.append("Restaking")
-            elif key == "stablecoin":
-                normalized.append("Stablecoin")
-            elif key == "rwa":
-                normalized.append("RWA")
-            elif key == "derivatives":
-                normalized.append("Derivatives")
-            elif key == "layer2":
-                normalized.append("Layer2")
-            else:
-                normalized.append(self._title_case_topic(topic))
-        return normalized
-
-    def _title_case_topic(self, topic: str) -> str:
-        if topic.isupper():
-            return topic
-        return topic.title()
-
     def _dedupe_preserve_order(self, values: List[str]) -> List[str]:
         return list(dict.fromkeys(values))
 
@@ -428,11 +398,11 @@ class ContentNormalizer:
         if source not in entity_sources[bucket][entity]:
             entity_sources[bucket][entity].append(source)
 
-    def _normalize_entity_sources(
+    def _finalize_entity_evidence(
         self,
         entity_sources: Dict[str, Dict[str, List[str]]],
     ) -> Dict[str, Dict[str, List[str]]]:
-        normalized: Dict[str, Dict[str, List[str]]] = {
+        finalized: Dict[str, Dict[str, List[str]]] = {
             "projects": {},
             "tokens": {},
             "chains": {},
@@ -441,12 +411,11 @@ class ContentNormalizer:
         }
         for bucket, values in entity_sources.items():
             for entity, sources in values.items():
-                normalized_entity = self._normalize_topics([entity])[0] if bucket == "topics" else entity
-                normalized.setdefault(bucket, {}).setdefault(normalized_entity, [])
+                finalized.setdefault(bucket, {}).setdefault(entity, [])
                 for source in sources:
-                    if source not in normalized[bucket][normalized_entity]:
-                        normalized[bucket][normalized_entity].append(source)
-        return normalized
+                    if source not in finalized[bucket][entity]:
+                        finalized[bucket][entity].append(source)
+        return finalized
 
     def _build_entity_confidence(
         self,
@@ -512,16 +481,10 @@ class ContentNormalizer:
         has_noise_signal: bool,
     ) -> Dict[EventType, float]:
         scores = self._init_event_type_scores()
-        self._score_event_type_from_entities(scores, item)
+        self._score_event_type_from_topics(scores, item)
         self._score_event_type_from_text(scores, text, title_text)
-        self._boost_event_type_scores_with_entities(scores, item)
-
-        if is_crypto and any(self._contains_alias(text, keyword) for keyword in INSTITUTIONAL_KEYWORDS):
-            if any(self._contains_alias(text, name) for name in INSTITUTION_NAMES):
-                scores[EventType.INSTITUTIONAL_ADOPTION] += 0.70
-
-        if is_crypto and any(self._contains_alias(text, keyword) for keyword in LAUNCH_KEYWORDS):
-            scores[EventType.PRODUCT_LAUNCH] += 0.55
+        self._score_event_type_from_context_boosts(scores, text, is_crypto)
+        self._boost_event_type_scores_with_entity_presence(scores, item)
 
         if has_macro_signal:
             scores[EventType.MACRO] += 0.55 if not is_crypto else 0.25
@@ -529,15 +492,14 @@ class ContentNormalizer:
         if has_noise_signal and not is_crypto:
             scores[EventType.MACRO] += 0.45
 
-        if any(self._contains_alias(title_text, keyword) for keyword in TITLE_MARKET_STRUCTURE_HINTS):
-            scores[EventType.MARKET_STRUCTURE] += 0.25
+        self._score_event_type_from_title_hints(scores, title_text)
 
         return scores
 
     def _init_event_type_scores(self) -> Dict[EventType, float]:
         event_types = {
             event_type
-            for event_type, _ in EVENT_TYPE_RULES
+            for event_type, _ in self.event_type_rules
         }
         event_types.update(
             {
@@ -548,10 +510,10 @@ class ContentNormalizer:
         )
         return {event_type: 0.0 for event_type in event_types}
 
-    def _score_event_type_from_entities(self, scores: Dict[EventType, float], item: ContentItem) -> None:
+    def _score_event_type_from_topics(self, scores: Dict[EventType, float], item: ContentItem) -> None:
         topic_confidence = item.entity_confidence.get("topics", {})
         for topic in item.entities.topics:
-            mapped_event_type = TOPIC_EVENT_TYPE_MAP.get(topic)
+            mapped_event_type = self._topic_event_type(topic)
             if not mapped_event_type:
                 continue
             confidence = topic_confidence.get(topic, "weak")
@@ -567,20 +529,57 @@ class ContentNormalizer:
             elif any(source.startswith("title:") for source in sources):
                 scores[mapped_event_type] += 0.10
 
+    def _topic_event_type(self, topic: str) -> EventType | None:
+        mapped_event_type = self.event_type_topic_overrides.get(topic)
+        if mapped_event_type:
+            return mapped_event_type
+
+        event_type_name = topic.upper().replace(" ", "_")
+        return EventType.__members__.get(event_type_name)
+
     def _score_event_type_from_text(
         self,
         scores: Dict[EventType, float],
         text: str,
         title_text: str,
     ) -> None:
-        for event_type, keywords in EVENT_TYPE_RULES:
+        for event_type, keywords in self.event_type_rules:
             for keyword in keywords:
                 if self._contains_alias(title_text, keyword):
                     scores[event_type] += 0.35
                 elif self._contains_alias(text, keyword):
                     scores[event_type] += 0.20
 
-    def _boost_event_type_scores_with_entities(
+    def _score_event_type_from_title_hints(
+        self,
+        scores: Dict[EventType, float],
+        title_text: str,
+    ) -> None:
+        for event_type, keywords in self.event_type_title_hints.items():
+            if any(self._contains_alias(title_text, keyword) for keyword in keywords):
+                scores[event_type] += 0.25
+
+    def _score_event_type_from_context_boosts(
+        self,
+        scores: Dict[EventType, float],
+        text: str,
+        is_crypto: bool,
+    ) -> None:
+        if not is_crypto:
+            return
+
+        for event_type, config in self.event_type_context_boosts.items():
+            keywords = config.get("keywords", [])
+            if not any(self._contains_alias(text, keyword) for keyword in keywords):
+                continue
+
+            required_names = config.get("required_names", [])
+            if required_names and not any(self._contains_alias(text, name) for name in required_names):
+                continue
+
+            scores[event_type] += float(config.get("boost", 0.0))
+
+    def _boost_event_type_scores_with_entity_presence(
         self,
         scores: Dict[EventType, float],
         item: ContentItem,
