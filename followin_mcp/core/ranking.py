@@ -3,10 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Set
 
+from .event_types import EventType
 from .models import EventCluster, UserProfile
 
 
 class UserRanker:
+    MMR_LAMBDA = 0.78
+
     def rank_for_user(self, user: UserProfile, clusters: List[EventCluster]) -> List[EventCluster]:
         if not clusters:
             return []
@@ -14,6 +17,8 @@ class UserRanker:
         scored = []
         now = datetime.now(timezone.utc)
         for cluster in clusters:
+            # Keep the ranking pipeline explainable: compute named signals first,
+            # then combine them with explicit weights.
             signals = self._compute_signals(user=user, cluster=cluster, now=now)
             scored.append({
                 "cluster": cluster,
@@ -76,10 +81,11 @@ class UserRanker:
                 "entity_sources": cluster.items[0].entity_sources if cluster.items else {},
                 "entity_confidence": cluster.items[0].entity_confidence if cluster.items else {},
                 "score_breakdown": {
-                    "importance": round(0.30 * row["signals"]["importance_score"], 4),
+                    "importance": round(0.25 * row["signals"]["importance_score"], 4),
                     "freshness": round(0.20 * row["signals"]["freshness_score"], 4),
-                    "follow": round(0.20 * row["signals"]["follow_affinity_score"], 4),
+                    "follow": round(0.18 * row["signals"]["follow_affinity_score"], 4),
                     "interest": round(0.15 * row["signals"]["interest_match_score"], 4),
+                    "semantic": round(0.12 * row["signals"]["semantic_match_score"], 4),
                     "source": round(0.10 * row["signals"]["source_quality_score"], 4),
                     "risk": round(0.05 * row["signals"]["risk_boost_score"], 4),
                     "mute_penalty": round(-0.20 * row["signals"]["mute_penalty"], 4),
@@ -93,22 +99,28 @@ class UserRanker:
         cluster: EventCluster,
         now: datetime,
     ) -> Dict[str, float]:
+        # Separate content quality, user affinity, and negative controls so each
+        # family of signals can be tuned independently.
         return {
             "importance_score": self._importance_score(cluster),
             "freshness_score": self._freshness_score(cluster, now),
             "follow_affinity_score": self._follow_affinity_score(user, cluster),
             "interest_match_score": self._interest_match_score(user, cluster),
+            "semantic_match_score": self._semantic_match_score(cluster),
             "source_quality_score": self._source_quality_score(cluster),
             "risk_boost_score": self._risk_boost_score(cluster),
             "mute_penalty": self._mute_penalty(user, cluster),
         }
 
     def _combine_signals(self, signals: Dict[str, float]) -> float:
+        # This stays as a lightweight heuristic ranker rather than a learned
+        # model, so weights are intentionally explicit and easy to inspect.
         score = (
-            0.30 * signals["importance_score"]
+            0.25 * signals["importance_score"]
             + 0.20 * signals["freshness_score"]
-            + 0.20 * signals["follow_affinity_score"]
+            + 0.18 * signals["follow_affinity_score"]
             + 0.15 * signals["interest_match_score"]
+            + 0.12 * signals["semantic_match_score"]
             + 0.10 * signals["source_quality_score"]
             + 0.05 * signals["risk_boost_score"]
             - 0.20 * signals["mute_penalty"]
@@ -177,8 +189,16 @@ class UserRanker:
         avg = sum(item.credibility_score for item in cluster.items) / len(cluster.items)
         return self._clamp(avg)
 
+    def _semantic_match_score(self, cluster: EventCluster) -> float:
+        if not cluster.items:
+            return 0.0
+        # At cluster level we care whether the event has at least one highly
+        # relevant supporting item, so use the best semantic hit instead of an average.
+        best = max(getattr(item, "semantic_match_score", 0.0) for item in cluster.items)
+        return self._clamp(best)
+
     def _risk_boost_score(self, cluster: EventCluster) -> float:
-        if cluster.event_type == "exploit":
+        if cluster.event_type == EventType.EXPLOIT:
             return 1.0
         if cluster.risks:
             return 0.7
@@ -208,37 +228,65 @@ class UserRanker:
     def _rerank(self, scored: List[Dict]) -> List[Dict]:
         if len(scored) <= 2:
             return scored
+
         remaining = scored[:]
-        result = []
-        used_recent_projects: List[Set[str]] = []
-        used_recent_topics: List[Set[str]] = []
+        result: List[Dict] = []
 
         while remaining:
-            chosen_idx = None
+            if not result:
+                # Keep the top-ranked candidate as the anchor item.
+                chosen = remaining.pop(0)
+                result.append(chosen)
+                continue
+
+            chosen_idx = 0
+            best_mmr = float("-inf")
             for idx, candidate in enumerate(remaining):
-                cluster = candidate["cluster"]
-                project_set = {x.lower() for x in cluster.entities.projects}
-                topic_set = {x.lower() for x in cluster.entities.topics}
-                if not result:
+                relevance = candidate["score"]
+                # Compare against a short recent window so we penalize local repetition
+                # without flattening the whole feed.
+                redundancy = max(
+                    self._cluster_redundancy(candidate["cluster"], selected["cluster"])
+                    for selected in result[-5:]
+                )
+                # MMR trades off base ranking quality against similarity to already-selected results.
+                mmr_score = self.MMR_LAMBDA * relevance - (1 - self.MMR_LAMBDA) * redundancy
+                if mmr_score > best_mmr:
+                    best_mmr = mmr_score
                     chosen_idx = idx
-                    break
 
-                recent_projects = used_recent_projects[-1] if used_recent_projects else set()
-                recent_topics = used_recent_topics[-1] if used_recent_topics else set()
-                same_project = bool(project_set and recent_projects and (project_set & recent_projects))
-                same_topic = bool(topic_set and recent_topics and (topic_set & recent_topics))
-                if not same_project and not same_topic:
-                    chosen_idx = idx
-                    break
-
-            if chosen_idx is None:
-                chosen_idx = 0
             chosen = remaining.pop(chosen_idx)
-            cluster = chosen["cluster"]
             result.append(chosen)
-            used_recent_projects.append({x.lower() for x in cluster.entities.projects})
-            used_recent_topics.append({x.lower() for x in cluster.entities.topics})
         return result
+
+    def _cluster_redundancy(self, left: EventCluster, right: EventCluster) -> float:
+        # Redundancy is simpler than clustering-time similarity: here we only
+        # need a feed-level "too similar to show back-to-back" signal.
+        project_overlap = self._set_overlap(left.entities.projects, right.entities.projects)
+        token_overlap = self._set_overlap(left.entities.tokens, right.entities.tokens)
+        topic_overlap = self._set_overlap(left.entities.topics, right.entities.topics)
+        chain_overlap = self._set_overlap(left.entities.chains, right.entities.chains)
+        event_type_overlap = 1.0 if left.event_type == right.event_type else 0.0
+
+        redundancy = (
+            0.34 * project_overlap
+            + 0.20 * token_overlap
+            + 0.20 * topic_overlap
+            + 0.10 * chain_overlap
+            + 0.16 * event_type_overlap
+        )
+        return self._clamp(redundancy)
+
+    def _set_overlap(self, left: List[str], right: List[str]) -> float:
+        if not left or not right:
+            return 0.0
+        left_set = {value.lower() for value in left}
+        right_set = {value.lower() for value in right}
+        intersection = left_set & right_set
+        union = left_set | right_set
+        if not union:
+            return 0.0
+        return len(intersection) / len(union)
 
     @staticmethod
     def _clamp(value: float, min_value: float = 0.0, max_value: float = 1.0) -> float:

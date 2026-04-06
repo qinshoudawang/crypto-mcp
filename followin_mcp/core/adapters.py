@@ -6,6 +6,15 @@ import requests
 
 
 class FollowinSourceAdapter(Protocol):
+    def get_latest_headlines_page(
+        self,
+        limit: int = 20,
+        last_cursor: Optional[str] = None,
+        no_tag: bool = False,
+        only_important: bool = False,
+    ) -> Dict[str, Any]:
+        ...
+
     def get_latest_headlines(
         self,
         limit: int = 20,
@@ -22,6 +31,15 @@ class FollowinSourceAdapter(Protocol):
     ) -> List[Dict[str, Any]]:
         ...
 
+    def get_project_feed_page(
+        self,
+        symbol: str,
+        feed_type: str = "tag_information_feed",
+        limit: int = 20,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        ...
+
     def get_project_feed(
         self,
         symbol: str,
@@ -31,12 +49,27 @@ class FollowinSourceAdapter(Protocol):
     ) -> List[Dict[str, Any]]:
         ...
 
+    def get_project_opinions_page(
+        self,
+        symbol: str,
+        limit: int = 20,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        ...
+
     def get_project_opinions(
         self,
         symbol: str,
         limit: int = 20,
         cursor: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        ...
+
+    def get_trending_topics_page(
+        self,
+        limit: int = 10,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
         ...
 
     def get_trending_topics(
@@ -68,13 +101,13 @@ class FollowinAPIAdapter:
         self.timeout = timeout
         self.session = requests.Session()
 
-    def get_latest_headlines(
+    def get_latest_headlines_page(
         self,
         limit: int = 20,
         last_cursor: Optional[str] = None,
         no_tag: bool = False,
         only_important: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         params = {
             "apikey": self.api_key,
             "lang": self.lang,
@@ -86,7 +119,23 @@ class FollowinAPIAdapter:
             params["last_cursor"] = last_cursor
 
         data = self._get("/open/feed/news", params)
-        return data.get("list", [])
+        response: Dict[str, Any] = {"items": data.get("list", [])}
+        response.update(self._extract_page_meta(data))
+        return response
+
+    def get_latest_headlines(
+        self,
+        limit: int = 20,
+        last_cursor: Optional[str] = None,
+        no_tag: bool = False,
+        only_important: bool = False,
+    ) -> List[Dict[str, Any]]:
+        return self.get_latest_headlines_page(
+            limit=limit,
+            last_cursor=last_cursor,
+            no_tag=no_tag,
+            only_important=only_important,
+        ).get("items", [])
 
     def get_trending_feeds(
         self,
@@ -112,6 +161,20 @@ class FollowinAPIAdapter:
         limit: int = 20,
         cursor: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        return self.get_project_feed_page(
+            symbol=symbol,
+            feed_type=feed_type,
+            limit=limit,
+            cursor=cursor,
+        ).get("items", [])
+
+    def get_project_feed_page(
+        self,
+        symbol: str,
+        feed_type: str = "tag_information_feed",
+        limit: int = 20,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
         allowed = {
             "tag_discussion_feed",
             "tag_information_feed",
@@ -132,7 +195,9 @@ class FollowinAPIAdapter:
             params["cursor"] = cursor
 
         data = self._get("/open/feed/list/tag", params)
-        return data.get("list", [])
+        response: Dict[str, Any] = {"items": data.get("list", [])}
+        response.update(self._extract_page_meta(data))
+        return response
 
     def get_project_opinions(
         self,
@@ -140,6 +205,18 @@ class FollowinAPIAdapter:
         limit: int = 20,
         cursor: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        return self.get_project_opinions_page(
+            symbol=symbol,
+            limit=limit,
+            cursor=cursor,
+        ).get("items", [])
+
+    def get_project_opinions_page(
+        self,
+        symbol: str,
+        limit: int = 20,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
         params = {
             "apikey": self.api_key,
             "symbol": symbol,
@@ -150,13 +227,22 @@ class FollowinAPIAdapter:
             params["cursor"] = cursor
 
         data = self._get("/open/feed/list/tag/opinions", params)
-        return data.get("list", [])
+        response: Dict[str, Any] = {"items": data.get("list", [])}
+        response.update(self._extract_page_meta(data))
+        return response
 
     def get_trending_topics(
         self,
         limit: int = 10,
         cursor: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        return self.get_trending_topics_page(limit=limit, cursor=cursor).get("items", [])
+
+    def get_trending_topics_page(
+        self,
+        limit: int = 10,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
         params = {
             "apikey": self.api_key,
             "lang": self.lang,
@@ -171,7 +257,9 @@ class FollowinAPIAdapter:
             for topic in day_block.get("topics", []):
                 topic["_day_start_ts"] = day_block.get("day_start_ts")
                 result.append(topic)
-        return result
+        response: Dict[str, Any] = {"items": result}
+        response.update(self._extract_page_meta(data))
+        return response
 
     def search_content(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         items = self.get_latest_headlines(limit=30)
@@ -196,3 +284,11 @@ class FollowinAPIAdapter:
                 f"Followin API error: code={payload.get('code')} msg={payload.get('msg')}"
             )
         return payload.get("data", {})
+
+    @staticmethod
+    def _extract_page_meta(data: Dict[str, Any]) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {}
+        for key in ("cursor", "next_cursor", "last_cursor", "has_more", "has_next"):
+            if key in data and data.get(key) is not None:
+                meta[key] = data.get(key)
+        return meta

@@ -1,43 +1,60 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List
 
+from .event_types import EventType
 from .models import ContentItem, Entities
+from .taxonomy_rules import (
+    CHAIN_KEYWORDS,
+    DEFAULT_DYNAMIC_ALIAS_PATH,
+    ENTITY_ALIASES,
+    EVENT_TYPE_RULES,
+    INSTITUTIONAL_KEYWORDS,
+    INSTITUTION_NAMES,
+    LAUNCH_KEYWORDS,
+    MACRO_KEYWORDS,
+    MARKET_STRUCTURE_KEYWORDS,
+    NON_CRYPTO_NOISE_KEYWORDS,
+    TITLE_EVENT_HINTS,
+    TITLE_MARKET_STRUCTURE_HINTS,
+    TOKEN_ALIASES,
+    TOPIC_ALIASES,
+    TOPIC_EVENT_TYPE_MAP,
+    TOPIC_KEYWORDS,
+)
 
 
 class ContentNormalizer:
-    CHAIN_KEYWORDS = ["solana", "base", "ethereum", "bitcoin"]
-    TOPIC_KEYWORDS = ["defi", "ai agents", "airdrop", "governance", "exploit"]
-    TOKEN_ALIASES = {
-        "BTC": ["btc", "bitcoin"],
-        "ETH": ["eth", "ethereum"],
-        "SOL": ["sol", "solana"],
-        "JUP": ["jup", "jupiter"],
-        "HYPE": ["hype", "hyperliquid"],
-    }
-    ENTITY_ALIASES = {
-        "Bitcoin": ["bitcoin", "btc"],
-        "Ethereum": ["ethereum", "eth"],
-        "Solana": ["solana", "sol"],
-        "Base": ["base", "base chain", "coinbase l2"],
-        "Jupiter": ["jupiter", "jup"],
-        "Hyperliquid": ["hyperliquid", "hype"],
-    }
-    TOPIC_ALIASES = {
-        "DeFi": ["defi", "dex", "amm", "yield", "lending", "perp", "perpetual"],
-        "AI Agents": ["ai agents", "ai agent", "agent", "autonomous agent"],
-        "NFT": ["nft", "ordinal", "ordinals"],
-        "Governance": ["governance", "proposal", "vote", "snapshot"],
-        "Airdrop": ["airdrop", "claim", "retroactive"],
-        "Exploit": ["exploit", "hack", "drain", "breach"],
-    }
-    NON_CRYPTO_KEYWORDS = [
-        "大使馆", "以色列", "伊朗", "沙特", "无人机", "空袭", "军事", "战争", "袭击",
-        "embassy", "israel", "iran", "saudi", "missile", "drone", "airstrike", "military",
-    ]
+    DEFAULT_DYNAMIC_ALIAS_PATH = DEFAULT_DYNAMIC_ALIAS_PATH
+    CHAIN_KEYWORDS = CHAIN_KEYWORDS
+    TOPIC_KEYWORDS = TOPIC_KEYWORDS
+    TITLE_EVENT_HINTS = TITLE_EVENT_HINTS
+    TOKEN_ALIASES = TOKEN_ALIASES
+    ENTITY_ALIASES = ENTITY_ALIASES
+    TOPIC_ALIASES = TOPIC_ALIASES
+    MACRO_KEYWORDS = MACRO_KEYWORDS
+    NON_CRYPTO_NOISE_KEYWORDS = NON_CRYPTO_NOISE_KEYWORDS
+
+    def __init__(self, dynamic_alias_path: str | None = None) -> None:
+        self.chain_keywords = list(self.CHAIN_KEYWORDS)
+        self.topic_keywords = list(self.TOPIC_KEYWORDS)
+        self.title_event_hints = dict(self.TITLE_EVENT_HINTS)
+        self.token_aliases = {key: list(value) for key, value in self.TOKEN_ALIASES.items()}
+        self.entity_aliases = {key: list(value) for key, value in self.ENTITY_ALIASES.items()}
+        self.topic_aliases = {key: list(value) for key, value in self.TOPIC_ALIASES.items()}
+        self.macro_keywords = list(self.MACRO_KEYWORDS)
+        self.non_crypto_noise_keywords = list(self.NON_CRYPTO_NOISE_KEYWORDS)
+        self.dynamic_alias_path = dynamic_alias_path or os.getenv(
+            "FOLLOWIN_DYNAMIC_ALIAS_PATH",
+            self.DEFAULT_DYNAMIC_ALIAS_PATH,
+        )
+        self._load_dynamic_aliases()
 
     def normalize(self, raw: Dict[str, Any]) -> ContentItem:
         title = raw.get("translated_title") or raw.get("title") or ""
@@ -100,40 +117,93 @@ class ContentNormalizer:
                     entities.tokens.append(symbol.upper())
                     self._record_entity_source(entity_sources, "tokens", symbol.upper(), "tag:symbol")
 
-        text = f"{item.title} {item.content}".lower()
+        title_text = item.title.lower()
+        body_text = item.content.lower()
+        full_text = f"{title_text} {body_text}".strip()
 
-        for chain in self.CHAIN_KEYWORDS:
-            if self._contains_alias(text, chain):
+        for chain in self.chain_keywords:
+            title_hit = self._contains_alias(title_text, chain)
+            body_hit = self._contains_alias(body_text, chain)
+            if title_hit or body_hit:
                 normalized_chain = chain.title()
                 entities.chains.append(normalized_chain)
-                self._record_entity_source(entity_sources, "chains", normalized_chain, f"text:{chain}")
+                if title_hit:
+                    self._record_entity_source(
+                        entity_sources, "chains", normalized_chain, f"title:{chain}"
+                    )
+                if body_hit:
+                    self._record_entity_source(
+                        entity_sources, "chains", normalized_chain, f"body:{chain}"
+                    )
 
-        for topic in self.TOPIC_KEYWORDS:
-            if self._contains_alias(text, topic):
+        for topic in self.topic_keywords:
+            title_hit = self._contains_topic_alias(title_text, topic)
+            body_hit = self._contains_topic_alias(body_text, topic)
+            if title_hit or body_hit:
                 normalized_topic = self._title_case_topic(topic)
                 entities.topics.append(normalized_topic)
-                self._record_entity_source(entity_sources, "topics", normalized_topic, f"text:{topic}")
+                if title_hit:
+                    self._record_entity_source(
+                        entity_sources, "topics", normalized_topic, f"title:{topic}"
+                    )
+                if body_hit:
+                    self._record_entity_source(
+                        entity_sources, "topics", normalized_topic, f"body:{topic}"
+                    )
 
-        for canonical_name, aliases in self.ENTITY_ALIASES.items():
-            matched_aliases = [alias for alias in aliases if self._contains_alias(text, alias)]
+        for canonical_name, aliases in self.entity_aliases.items():
+            matched_aliases = [
+                alias
+                for alias in aliases
+                if self._contains_alias(title_text, alias) or self._contains_alias(body_text, alias)
+            ]
             if matched_aliases:
                 entities.projects.append(canonical_name)
                 for alias in matched_aliases:
-                    self._record_entity_source(entity_sources, "projects", canonical_name, f"text:{alias}")
+                    if self._contains_alias(title_text, alias):
+                        self._record_entity_source(
+                            entity_sources, "projects", canonical_name, f"title:{alias}"
+                        )
+                    if self._contains_alias(body_text, alias):
+                        self._record_entity_source(
+                            entity_sources, "projects", canonical_name, f"body:{alias}"
+                        )
 
-        for symbol, aliases in self.TOKEN_ALIASES.items():
-            matched_aliases = [alias for alias in aliases if self._contains_alias(text, alias)]
+        for symbol, aliases in self.token_aliases.items():
+            matched_aliases = [
+                alias
+                for alias in aliases
+                if self._contains_alias(title_text, alias) or self._contains_alias(body_text, alias)
+            ]
             if matched_aliases:
                 entities.tokens.append(symbol)
                 for alias in matched_aliases:
-                    self._record_entity_source(entity_sources, "tokens", symbol, f"text:{alias}")
+                    if self._contains_alias(title_text, alias):
+                        self._record_entity_source(
+                            entity_sources, "tokens", symbol, f"title:{alias}"
+                        )
+                    if self._contains_alias(body_text, alias):
+                        self._record_entity_source(
+                            entity_sources, "tokens", symbol, f"body:{alias}"
+                        )
 
-        for canonical_topic, aliases in self.TOPIC_ALIASES.items():
-            matched_aliases = [alias for alias in aliases if self._contains_alias(text, alias)]
+        for canonical_topic, aliases in self.topic_aliases.items():
+            matched_aliases = [
+                alias
+                for alias in aliases
+                if self._contains_topic_alias(full_text, alias)
+            ]
             if matched_aliases:
                 entities.topics.append(canonical_topic)
                 for alias in matched_aliases:
-                    self._record_entity_source(entity_sources, "topics", canonical_topic, f"text:{alias}")
+                    if self._contains_topic_alias(title_text, alias):
+                        self._record_entity_source(
+                            entity_sources, "topics", canonical_topic, f"title:{alias}"
+                        )
+                    if self._contains_topic_alias(body_text, alias):
+                        self._record_entity_source(
+                            entity_sources, "topics", canonical_topic, f"body:{alias}"
+                        )
 
         entities.projects = self._dedupe_preserve_order(entities.projects)
         entities.tokens = self._dedupe_preserve_order(entities.tokens)
@@ -144,38 +214,26 @@ class ContentNormalizer:
         item.entity_confidence = self._build_entity_confidence(item.entity_sources)
         return entities
 
-    def classify_event_type(self, item: ContentItem) -> str:
+    def classify_event_type(self, item: ContentItem) -> EventType:
         text = f"{item.title} {item.content}".lower()
-        is_crypto = bool(item.entities.projects or item.entities.tokens or item.entities.chains or item.entities.topics)
-        if any(keyword in text for keyword in self.NON_CRYPTO_KEYWORDS) and not is_crypto:
-            return "macro"
+        title_text = item.title.lower()
+        is_crypto = self._has_crypto_entity_signal(item)
+        has_macro_signal = any(self._contains_alias(text, keyword) for keyword in self.macro_keywords)
+        has_noise_signal = any(keyword in text for keyword in self.non_crypto_noise_keywords)
 
-        rules = {
-            "exploit": ["exploit", "hack", "drain", "breach", "攻击", "被盗", "漏洞"],
-            "partnership": ["partnership", "collaboration", "partnered", "合作"],
-            "governance": ["proposal", "vote", "governance", "提案", "投票", "治理"],
-            "airdrop": ["airdrop", "claim", "空投", "领取"],
-            "listing": ["listing", "listed", "上线交易", "上架交易", "登陆币安", "登陆交易所"],
-        }
-        for event_type, keywords in rules.items():
-            if any(self._contains_alias(text, keyword) for keyword in keywords):
-                return event_type
+        if has_macro_signal and not is_crypto:
+            return EventType.MACRO
 
-        institutional_keywords = [
-            "现货交易", "spot trading", "提供交易", "支持交易", "开放交易",
-            "计划推出", "plans to launch", "considering offering", "考虑推出", "考虑提供",
-        ]
-        institution_names = [
-            "嘉信理财", "schwab", "fidelity", "blackrock", "coinbase", "binance", "okx",
-        ]
-        if is_crypto and any(self._contains_alias(text, keyword) for keyword in institutional_keywords):
-            if any(self._contains_alias(text, name) for name in institution_names):
-                return "institutional_adoption"
+        if has_noise_signal and not is_crypto:
+            return EventType.UNKNOWN
 
-        launch_keywords = ["launch", "announced", "program", "release", "推出", "主网上线"]
-        if is_crypto and any(self._contains_alias(text, keyword) for keyword in launch_keywords):
-            return "product_launch"
-        return "unknown"
+        scores = self._build_event_type_scores(item, text, title_text, is_crypto, has_macro_signal, has_noise_signal)
+        best_event_type, best_score = max(scores.items(), key=lambda item_score: item_score[1])
+        if best_score >= 0.35:
+            return best_event_type
+        if has_macro_signal:
+            return EventType.MACRO
+        return EventType.UNKNOWN
 
     def assess_credibility(self, item: ContentItem) -> float:
         source_name = (item.source_type or "").lower()
@@ -188,15 +246,34 @@ class ContentNormalizer:
         return 0.50
 
     def assess_importance(self, item: ContentItem) -> float:
-        score = 0.30
-        if item.event_type in {"exploit", "governance", "product_launch", "institutional_adoption"}:
-            score += 0.25
-        if item.entities.projects:
-            score += 0.15
-        if item.entities.tokens:
+        score = 0.20
+        score += self.title_event_hints.get(item.event_type, 0.0)
+
+        entity_confidence = item.entity_confidence
+        strong_projects = self._count_confidence_level(entity_confidence.get("projects", {}), "strong")
+        strong_tokens = self._count_confidence_level(entity_confidence.get("tokens", {}), "strong")
+        strong_topics = self._count_confidence_level(entity_confidence.get("topics", {}), "strong")
+
+        if strong_projects:
+            score += 0.18
+        elif item.entities.projects:
             score += 0.10
-        score += (item.credibility_score - 0.5) * 0.3
-        return round(min(score, 1.0), 2)
+
+        if strong_tokens:
+            score += 0.10
+        elif item.entities.tokens:
+            score += 0.05
+
+        if strong_topics:
+            score += 0.08
+        elif item.entities.topics:
+            score += 0.04
+
+        if self._has_title_entity_hit(item.entity_sources):
+            score += 0.08
+
+        score += (item.credibility_score - 0.5) * 0.24
+        return round(self._clamp(score), 2)
 
     def _make_summary(self, text: str, max_len: int = 120) -> str:
         cleaned = re.sub(r"\s+", " ", text).strip()
@@ -228,6 +305,66 @@ class ContentNormalizer:
             return re.search(pattern, text) is not None
         return normalized_alias in text
 
+    def _contains_topic_alias(self, text: str, alias: str) -> bool:
+        normalized_alias = alias.lower().strip()
+        if normalized_alias == "agent":
+            return self._contains_ai_agent_context(text)
+        if normalized_alias == "yield":
+            return self._contains_defi_yield_context(text)
+        return self._contains_alias(text, normalized_alias)
+
+    def _contains_ai_agent_context(self, text: str) -> bool:
+        strong_patterns = [
+            "ai agents",
+            "ai agent",
+            "agent skills",
+            "agentic",
+            "autonomous agent",
+            "onchain agent",
+            "on-chain agent",
+        ]
+        if any(self._contains_alias(text, pattern) for pattern in strong_patterns):
+            return True
+
+        guarded_patterns = [
+            r"\bagent\b.{0,20}\bai\b",
+            r"\bai\b.{0,20}\bagent\b",
+            r"\bagent\b.{0,20}\bwallet\b",
+            r"\bagent\b.{0,20}\bon[- ]?chain\b",
+        ]
+        return any(re.search(pattern, text) is not None for pattern in guarded_patterns)
+
+    def _contains_defi_yield_context(self, text: str) -> bool:
+        blocked_patterns = [
+            "treasury yield",
+            "bond yield",
+            "yield curve",
+            "10-year yield",
+            "2-year yield",
+        ]
+        if any(self._contains_alias(text, pattern) for pattern in blocked_patterns):
+            return False
+
+        defi_patterns = [
+            "yield farming",
+            "yield farm",
+            "yield-bearing",
+            "yield vault",
+            "defi yield",
+            "staking yield",
+            "lending yield",
+        ]
+        if any(self._contains_alias(text, pattern) for pattern in defi_patterns):
+            return True
+
+        guarded_patterns = [
+            r"\byield\b.{0,20}\bfarm",
+            r"\byield\b.{0,20}\bdefi\b",
+            r"\byield\b.{0,20}\blending\b",
+            r"\byield\b.{0,20}\bstaking\b",
+        ]
+        return any(re.search(pattern, text) is not None for pattern in guarded_patterns)
+
     def _normalize_topics(self, topics: List[str]) -> List[str]:
         normalized: List[str] = []
         for topic in topics:
@@ -244,6 +381,30 @@ class ContentNormalizer:
                 normalized.append("Airdrop")
             elif key == "exploit":
                 normalized.append("Exploit")
+            elif key == "listing":
+                normalized.append("Listing")
+            elif key == "funding":
+                normalized.append("Funding")
+            elif key == "memecoin":
+                normalized.append("Memecoin")
+            elif key == "token unlock":
+                normalized.append("Token Unlock")
+            elif key == "partnership":
+                normalized.append("Partnership")
+            elif key == "merger":
+                normalized.append("Merger")
+            elif key == "incentive program":
+                normalized.append("Incentive Program")
+            elif key == "restaking":
+                normalized.append("Restaking")
+            elif key == "stablecoin":
+                normalized.append("Stablecoin")
+            elif key == "rwa":
+                normalized.append("RWA")
+            elif key == "derivatives":
+                normalized.append("Derivatives")
+            elif key == "layer2":
+                normalized.append("Layer2")
             else:
                 normalized.append(self._title_case_topic(topic))
         return normalized
@@ -301,10 +462,15 @@ class ContentNormalizer:
         for bucket, values in entity_sources.items():
             for entity, sources in values.items():
                 has_tag = any(source.startswith("tag:") for source in sources)
-                has_text = any(source.startswith("text:") for source in sources)
-                if has_tag and has_text:
+                has_title = any(source.startswith("title:") for source in sources)
+                has_body = any(source.startswith("body:") for source in sources)
+                if has_tag and (has_title or has_body):
                     level = "strong"
-                elif bucket in {"chains", "topics"} and has_text:
+                elif has_title and has_body:
+                    level = "strong"
+                elif has_title:
+                    level = "medium"
+                elif bucket in {"chains", "topics"} and has_body:
                     level = "strong"
                 elif has_tag:
                     level = "medium"
@@ -312,3 +478,165 @@ class ContentNormalizer:
                     level = "weak"
                 confidence.setdefault(bucket, {})[entity] = level
         return confidence
+
+    def _count_confidence_level(self, values: Dict[str, str], target_level: str) -> int:
+        return sum(1 for level in values.values() if level == target_level)
+
+    def _has_title_entity_hit(self, entity_sources: Dict[str, Dict[str, List[str]]]) -> bool:
+        for bucket in ("projects", "tokens", "chains", "topics"):
+            for sources in entity_sources.get(bucket, {}).values():
+                if any(source.startswith("title:") for source in sources):
+                    return True
+        return False
+
+    def _has_crypto_entity_signal(self, item: ContentItem) -> bool:
+        entity_confidence = item.entity_confidence
+        for bucket in ("projects", "tokens", "chains", "topics"):
+            values = entity_confidence.get(bucket, {})
+            if any(level in {"strong", "medium"} for level in values.values()):
+                return True
+        return bool(
+            item.entities.projects
+            or item.entities.tokens
+            or item.entities.chains
+            or item.entities.topics
+        )
+
+    def _build_event_type_scores(
+        self,
+        item: ContentItem,
+        text: str,
+        title_text: str,
+        is_crypto: bool,
+        has_macro_signal: bool,
+        has_noise_signal: bool,
+    ) -> Dict[EventType, float]:
+        scores = self._init_event_type_scores()
+        self._score_event_type_from_entities(scores, item)
+        self._score_event_type_from_text(scores, text, title_text)
+        self._boost_event_type_scores_with_entities(scores, item)
+
+        if is_crypto and any(self._contains_alias(text, keyword) for keyword in INSTITUTIONAL_KEYWORDS):
+            if any(self._contains_alias(text, name) for name in INSTITUTION_NAMES):
+                scores[EventType.INSTITUTIONAL_ADOPTION] += 0.70
+
+        if is_crypto and any(self._contains_alias(text, keyword) for keyword in LAUNCH_KEYWORDS):
+            scores[EventType.PRODUCT_LAUNCH] += 0.55
+
+        if has_macro_signal:
+            scores[EventType.MACRO] += 0.55 if not is_crypto else 0.25
+
+        if has_noise_signal and not is_crypto:
+            scores[EventType.MACRO] += 0.45
+
+        if any(self._contains_alias(title_text, keyword) for keyword in TITLE_MARKET_STRUCTURE_HINTS):
+            scores[EventType.MARKET_STRUCTURE] += 0.25
+
+        return scores
+
+    def _init_event_type_scores(self) -> Dict[EventType, float]:
+        event_types = {
+            event_type
+            for event_type, _ in EVENT_TYPE_RULES
+        }
+        event_types.update(
+            {
+                EventType.INSTITUTIONAL_ADOPTION,
+                EventType.PRODUCT_LAUNCH,
+                EventType.MACRO,
+            }
+        )
+        return {event_type: 0.0 for event_type in event_types}
+
+    def _score_event_type_from_entities(self, scores: Dict[EventType, float], item: ContentItem) -> None:
+        topic_confidence = item.entity_confidence.get("topics", {})
+        for topic in item.entities.topics:
+            mapped_event_type = TOPIC_EVENT_TYPE_MAP.get(topic)
+            if not mapped_event_type:
+                continue
+            confidence = topic_confidence.get(topic, "weak")
+            sources = item.entity_sources.get("topics", {}).get(topic, [])
+            if confidence == "strong":
+                scores[mapped_event_type] += 0.90
+                if any(source.startswith("title:") for source in sources):
+                    scores[mapped_event_type] += 0.10
+            elif confidence == "medium":
+                scores[mapped_event_type] += 0.45
+                if any(source.startswith("title:") for source in sources):
+                    scores[mapped_event_type] += 0.15
+            elif any(source.startswith("title:") for source in sources):
+                scores[mapped_event_type] += 0.10
+
+    def _score_event_type_from_text(
+        self,
+        scores: Dict[EventType, float],
+        text: str,
+        title_text: str,
+    ) -> None:
+        for event_type, keywords in EVENT_TYPE_RULES:
+            for keyword in keywords:
+                if self._contains_alias(title_text, keyword):
+                    scores[event_type] += 0.35
+                elif self._contains_alias(text, keyword):
+                    scores[event_type] += 0.20
+
+    def _boost_event_type_scores_with_entities(
+        self,
+        scores: Dict[EventType, float],
+        item: ContentItem,
+    ) -> None:
+        has_projects = bool(item.entities.projects)
+        has_tokens = bool(item.entities.tokens)
+        has_chains = bool(item.entities.chains)
+
+        if has_tokens:
+            if scores[EventType.LISTING] > 0:
+                scores[EventType.LISTING] += 0.10
+            if scores[EventType.TOKEN_UNLOCK] > 0:
+                scores[EventType.TOKEN_UNLOCK] += 0.12
+
+        if has_projects:
+            if scores[EventType.FUNDING] > 0:
+                scores[EventType.FUNDING] += 0.10
+            if scores[EventType.PARTNERSHIP] > 0:
+                scores[EventType.PARTNERSHIP] += 0.08
+            if scores[EventType.MERGER] > 0:
+                scores[EventType.MERGER] += 0.08
+            if scores[EventType.PRODUCT_LAUNCH] > 0:
+                scores[EventType.PRODUCT_LAUNCH] += 0.10
+            if scores[EventType.GOVERNANCE] > 0:
+                scores[EventType.GOVERNANCE] += 0.08
+            if scores[EventType.INCENTIVE_PROGRAM] > 0:
+                scores[EventType.INCENTIVE_PROGRAM] += 0.08
+
+        if has_tokens or has_chains:
+            if scores[EventType.MARKET_STRUCTURE] > 0:
+                scores[EventType.MARKET_STRUCTURE] += 0.08
+
+    @staticmethod
+    def _clamp(value: float, min_value: float = 0.0, max_value: float = 1.0) -> float:
+        return max(min_value, min(value, max_value))
+
+    def _load_dynamic_aliases(self) -> None:
+        config_path = Path(self.dynamic_alias_path)
+        if not config_path.exists():
+            return
+
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+
+        self._merge_alias_map(self.entity_aliases, payload.get("entity_aliases", {}))
+        self._merge_alias_map(self.token_aliases, payload.get("token_aliases", {}))
+        self._merge_alias_map(self.topic_aliases, payload.get("topic_aliases", {}))
+
+    def _merge_alias_map(self, target: Dict[str, List[str]], updates: Dict[str, List[str]]) -> None:
+        for canonical_name, aliases in updates.items():
+            merged = list(target.get(canonical_name, []))
+            for alias in aliases:
+                normalized_alias = alias.strip()
+                if normalized_alias and normalized_alias not in merged:
+                    merged.append(normalized_alias)
+            if merged:
+                target[canonical_name] = merged

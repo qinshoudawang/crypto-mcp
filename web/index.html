@@ -182,6 +182,11 @@
         align-self: flex-start;
       }
 
+      .message.pending {
+        background: rgba(255, 255, 255, 0.82);
+        border-style: dashed;
+      }
+
       .meta {
         font-size: 11px;
         color: var(--muted);
@@ -195,6 +200,53 @@
       .message-text {
         line-height: 1.65;
         font-size: 14px;
+      }
+
+      .thinking {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        min-height: 24px;
+      }
+
+      .thinking-label {
+        font-size: 13px;
+        letter-spacing: 0.04em;
+      }
+
+      .thinking-dots {
+        display: inline-flex;
+        gap: 6px;
+        align-items: center;
+      }
+
+      .thinking-dots span {
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: linear-gradient(135deg, var(--accent), var(--warm));
+        animation: thinking-bounce 1.15s infinite ease-in-out;
+        opacity: 0.35;
+      }
+
+      .thinking-dots span:nth-child(2) {
+        animation-delay: 0.16s;
+      }
+
+      .thinking-dots span:nth-child(3) {
+        animation-delay: 0.32s;
+      }
+
+      @keyframes thinking-bounce {
+        0%, 80%, 100% {
+          transform: translateY(0) scale(0.9);
+          opacity: 0.3;
+        }
+        40% {
+          transform: translateY(-4px) scale(1);
+          opacity: 1;
+        }
       }
 
       .message-text h3 {
@@ -264,6 +316,30 @@
         margin-top: 12px;
       }
 
+      .live-log {
+        margin-top: 12px;
+        padding: 12px 14px;
+        border-radius: 16px;
+        background: rgba(13, 139, 115, 0.08);
+        border: 1px solid rgba(13, 139, 115, 0.12);
+      }
+
+      .live-log-title {
+        margin-bottom: 8px;
+        font-size: 12px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+
+      .live-log-line {
+        font-size: 12px;
+        line-height: 1.6;
+        color: var(--muted);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
       .card {
         border-radius: 16px;
         padding: 14px;
@@ -275,6 +351,18 @@
         font-size: 13px;
         font-weight: 700;
         line-height: 1.45;
+      }
+
+      .card-title a {
+        color: inherit;
+        text-decoration: none;
+        border-bottom: 1px solid transparent;
+        transition: border-color 120ms ease, color 120ms ease;
+      }
+
+      .card-title a:hover {
+        color: var(--accent);
+        border-bottom-color: rgba(13, 139, 115, 0.35);
       }
 
       .card-sub {
@@ -311,6 +399,13 @@
       .toolbar {
         display: grid;
         gap: 10px;
+      }
+
+      .composer-hint {
+        grid-column: 1 / -1;
+        margin-top: -4px;
+        font-size: 12px;
+        color: var(--muted);
       }
 
       .session-pill {
@@ -435,6 +530,7 @@
         <div class="composer">
           <textarea id="input" placeholder="比如：给我推荐今天值得看的 crypto 内容，或者看看 Base 最近有什么新动态"></textarea>
           <button class="primary" id="sendBtn">发送</button>
+          <div class="composer-hint">回车发送，Shift + Enter 换行</div>
         </div>
       </main>
     </div>
@@ -445,6 +541,10 @@
         messages: [],
         sessionId: null,
         hasInteracted: false,
+        eventSource: null,
+        liveToolEvents: [],
+        pendingMessageEl: null,
+        pendingAssistantText: "",
       };
 
       const els = {
@@ -487,6 +587,23 @@
         els.messages.innerHTML = "";
       }
 
+      function resetConversationState() {
+        state.messages = [];
+        state.liveToolEvents = [];
+        state.hasInteracted = false;
+        state.pendingAssistantText = "";
+        removePendingMessage();
+        if (state.eventSource) {
+          state.eventSource.close();
+          state.eventSource = null;
+        }
+        state.sessionId = null;
+        els.messages.innerHTML = "";
+        els.input.value = "";
+        updateComposerPlaceholder();
+        renderSession();
+      }
+
       function updateComposerPlaceholder() {
         els.input.placeholder = state.hasInteracted
           ? ""
@@ -523,10 +640,14 @@
           }
         }
 
-        function openList(type) {
+        function openList(type, startNumber = null) {
           if (inList && listType === type) return;
           closeListIfNeeded();
-          parts.push(type === "ol" ? "<ol>" : "<ul>");
+          if (type === "ol" && typeof startNumber === "number" && startNumber > 1) {
+            parts.push(`<ol start="${startNumber}">`);
+          } else {
+            parts.push(type === "ol" ? "<ol>" : "<ul>");
+          }
           inList = true;
           listType = type;
         }
@@ -592,7 +713,7 @@
 
           const orderedMatch = line.match(/^(\d+)[.)]\s+(.+)$/);
           if (orderedMatch) {
-            openList("ol");
+            openList("ol", Number(orderedMatch[1]));
             parts.push(`<li>${formatInline(orderedMatch[2])}</li>`);
             continue;
           }
@@ -658,6 +779,19 @@
             args.textContent = `args: ${JSON.stringify(run.tool_arguments || {}, null, 2)}`;
             body.appendChild(args);
 
+            const metaKeys = ["cursor", "next_cursor", "last_cursor", "has_more", "has_next"];
+            const metaPayload = Object.fromEntries(
+              metaKeys
+                .filter((key) => Object.prototype.hasOwnProperty.call(run, key))
+                .map((key) => [key, run[key]])
+            );
+            if (Object.keys(metaPayload).length) {
+              const metaBlock = document.createElement("div");
+              metaBlock.className = "tool-args";
+              metaBlock.textContent = `meta: ${JSON.stringify(metaPayload, null, 2)}`;
+              body.appendChild(metaBlock);
+            }
+
             if (Array.isArray(run.items) && run.items.length) {
               const cards = document.createElement("div");
               cards.className = "cards";
@@ -667,7 +801,17 @@
 
                 const title = document.createElement("div");
                 title.className = "card-title";
-                title.textContent = item.title || item.name || item.topic_name || item.topic || "untitled";
+                const titleText = item.title || item.name || item.topic_name || item.topic || "untitled";
+                if (item.url) {
+                  const link = document.createElement("a");
+                  link.href = item.url;
+                  link.target = "_blank";
+                  link.rel = "noopener noreferrer";
+                  link.textContent = titleText;
+                  title.appendChild(link);
+                } else {
+                  title.textContent = titleText;
+                }
                 card.appendChild(title);
 
                 const sub = document.createElement("div");
@@ -686,8 +830,201 @@
           });
         }
 
+        if (role === "agent" && Array.isArray(meta.live_events) && meta.live_events.length) {
+          const liveLog = document.createElement("div");
+          liveLog.className = "live-log";
+
+          const title = document.createElement("div");
+          title.className = "live-log-title";
+          title.textContent = "Live MCP Trace";
+          liveLog.appendChild(title);
+
+          meta.live_events.forEach((event) => {
+            const line = document.createElement("div");
+            line.className = "live-log-line";
+            line.textContent = formatToolEvent(event);
+            liveLog.appendChild(line);
+          });
+
+          wrapper.appendChild(liveLog);
+        }
+
         els.messages.appendChild(wrapper);
         els.messages.scrollTop = els.messages.scrollHeight;
+        return wrapper;
+      }
+
+      function renderPendingContent(target, liveEvents = [], partialText = "") {
+        target.innerHTML = "";
+
+        if (partialText && partialText.trim()) {
+          const partial = document.createElement("div");
+          partial.innerHTML = renderRichText(partialText);
+          target.appendChild(partial);
+        }
+
+        const thinking = document.createElement("div");
+        thinking.className = "thinking";
+
+        const label = document.createElement("div");
+        label.className = "thinking-label";
+        label.textContent = liveEvents.length ? "正在调用工具并整理回复" : "正在思考";
+        thinking.appendChild(label);
+
+        const dots = document.createElement("div");
+        dots.className = "thinking-dots";
+        dots.innerHTML = "<span></span><span></span><span></span>";
+        thinking.appendChild(dots);
+        target.appendChild(thinking);
+
+        if (Array.isArray(liveEvents) && liveEvents.length) {
+          const liveLog = document.createElement("div");
+          liveLog.className = "live-log";
+
+          const title = document.createElement("div");
+          title.className = "live-log-title";
+          title.textContent = "Live MCP Trace";
+          liveLog.appendChild(title);
+
+          liveEvents.forEach((event) => {
+            const line = document.createElement("div");
+            line.className = "live-log-line";
+            line.textContent = formatToolEvent(event);
+            liveLog.appendChild(line);
+          });
+
+          target.appendChild(liveLog);
+        }
+      }
+
+      function createPendingMessage() {
+        removePendingMessage();
+
+        const wrapper = document.createElement("div");
+        wrapper.className = "message agent pending";
+
+        const metaEl = document.createElement("div");
+        metaEl.className = "meta";
+        metaEl.textContent = "Agent";
+        wrapper.appendChild(metaEl);
+
+        const textEl = document.createElement("div");
+        textEl.className = "message-text";
+        wrapper.appendChild(textEl);
+
+        state.pendingAssistantText = "";
+        renderPendingContent(textEl, state.liveToolEvents, state.pendingAssistantText);
+        els.messages.appendChild(wrapper);
+        els.messages.scrollTop = els.messages.scrollHeight;
+        state.pendingMessageEl = wrapper;
+      }
+
+      function refreshPendingMessage() {
+        if (!state.pendingMessageEl) return;
+        const textEl = state.pendingMessageEl.querySelector(".message-text");
+        if (!textEl) return;
+        renderPendingContent(textEl, state.liveToolEvents, state.pendingAssistantText);
+        els.messages.scrollTop = els.messages.scrollHeight;
+      }
+
+      function removePendingMessage() {
+        if (state.pendingMessageEl && state.pendingMessageEl.parentNode) {
+          state.pendingMessageEl.parentNode.removeChild(state.pendingMessageEl);
+        }
+        state.pendingMessageEl = null;
+        state.pendingAssistantText = "";
+      }
+
+      async function readSseResponse(response, handlers) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary !== -1) {
+            const rawEvent = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+
+            let eventName = "message";
+            const dataLines = [];
+            rawEvent.split("\n").forEach((line) => {
+              if (line.startsWith("event:")) {
+                eventName = line.slice(6).trim();
+              } else if (line.startsWith("data:")) {
+                dataLines.push(line.slice(5).trim());
+              }
+            });
+
+            const rawData = dataLines.join("\n");
+            let payload = {};
+            if (rawData) {
+              try {
+                payload = JSON.parse(rawData);
+              } catch (_error) {
+                payload = { raw: rawData };
+              }
+            }
+
+            if (handlers[eventName]) {
+              handlers[eventName](payload);
+            }
+
+            boundary = buffer.indexOf("\n\n");
+          }
+        }
+      }
+
+      function formatToolEvent(event) {
+        if (!event || !event.type) return "MCP event";
+        if (event.type === "tool_start") {
+          return `Connecting to ${event.server_url} -> ${event.tool_name}(${JSON.stringify(event.arguments || {})})`;
+        }
+        if (event.type === "tool_progress") {
+          if (event.total) {
+            const percent = Math.round((event.progress / event.total) * 100);
+            return `${event.tool_name}: ${percent}% ${event.message || ""}`.trim();
+          }
+          return `${event.tool_name}: progress ${event.progress}${event.message ? `, ${event.message}` : ""}`;
+        }
+        if (event.type === "tool_result") {
+          return `${event.tool_name}: ${event.preview || "result received"}`;
+        }
+        if (event.type === "tool_complete") {
+          return `${event.tool_name}: completed`;
+        }
+        if (event.type === "tool_error") {
+          return `${event.tool_name}: ${event.message || "failed"}`;
+        }
+        return `${event.tool_name || "tool"}: ${event.type}`;
+      }
+
+      function attachEventStream() {
+        if (!state.sessionId) return;
+        if (state.eventSource) {
+          state.eventSource.close();
+          state.eventSource = null;
+        }
+
+        state.eventSource = new EventSource(`/api/session/${state.sessionId}/events`);
+        state.eventSource.addEventListener("tool", (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload && payload.type === "profile_update" && payload.profile) {
+              state.profile = payload.profile;
+              renderProfile();
+              return;
+            }
+            state.liveToolEvents.push(payload);
+            refreshPendingMessage();
+          } catch (error) {
+            console.warn("Failed to parse MCP tool event", error);
+          }
+        });
       }
 
       async function createSession() {
@@ -702,7 +1039,13 @@
         }
         const data = await response.json();
         state.sessionId = data.session_id;
+        if (data.profile) {
+          state.profile = data.profile;
+        }
+        state.liveToolEvents = [];
+        attachEventStream();
         renderSession();
+        renderProfile();
       }
 
       function seedWelcomeMessage() {
@@ -716,17 +1059,24 @@
         els.randomizeBtn.disabled = true;
         els.newSessionBtn.disabled = true;
         try {
-          const response = await fetch("/api/profile/random");
+          const params = new URLSearchParams();
+          if (state.profile && state.profile.user_id) {
+            params.set("exclude_user_id", state.profile.user_id);
+          }
+          const query = params.toString();
+          const response = await fetch(`/api/profile/random${query ? `?${query}` : ""}`, {
+            cache: "no-store",
+          });
           if (!response.ok) {
             throw new Error("Failed to load profile");
           }
+          resetConversationState();
           state.profile = await response.json();
           renderProfile();
-          clearMessages();
           await createSession();
           seedWelcomeMessage();
         } catch (error) {
-          clearMessages();
+          resetConversationState();
           createMessage("agent", `初始化失败：${error.message}`);
         } finally {
           els.randomizeBtn.disabled = false;
@@ -742,13 +1092,15 @@
         updateComposerPlaceholder();
         createMessage("user", message);
         state.messages.push({ role: "user", content: message });
+        state.liveToolEvents = [];
+        createPendingMessage();
         els.input.value = "";
         els.sendBtn.disabled = true;
         els.newSessionBtn.disabled = true;
         els.randomizeBtn.disabled = true;
 
         try {
-          const response = await fetch("/api/chat", {
+          const response = await fetch("/api/chat/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -760,12 +1112,41 @@
           if (!response.ok) {
             throw new Error("Chat request failed");
           }
-
-          const data = await response.json();
-          createMessage("agent", data.assistant_message, { tool_runs: data.tool_runs || [] });
-          state.messages.push({ role: "assistant", content: data.assistant_message });
+          await readSseResponse(response, {
+            assistant_chunk(payload) {
+              const delta = typeof payload.delta === "string" ? payload.delta : "";
+              if (!delta) return;
+              state.pendingAssistantText += delta;
+              refreshPendingMessage();
+            },
+            done(payload) {
+              if (payload.profile) {
+                state.profile = payload.profile;
+              }
+              renderProfile();
+              const finalText =
+                typeof payload.assistant_message === "string" && payload.assistant_message
+                  ? payload.assistant_message
+                  : state.pendingAssistantText;
+              removePendingMessage();
+              createMessage("agent", finalText, {
+                tool_runs: payload.tool_runs || [],
+                live_events: state.liveToolEvents.slice(),
+              });
+              state.liveToolEvents = [];
+              state.messages.push({ role: "assistant", content: finalText });
+            },
+            error(payload) {
+              const message = payload.message || "Chat request failed";
+              removePendingMessage();
+              createMessage("agent", `请求失败：${message}`);
+              state.liveToolEvents = [];
+            },
+          });
         } catch (error) {
+          removePendingMessage();
           createMessage("agent", `请求失败：${error.message}`);
+          state.liveToolEvents = [];
         } finally {
           els.sendBtn.disabled = false;
           els.newSessionBtn.disabled = false;
@@ -791,7 +1172,8 @@
       els.randomizeBtn.addEventListener("click", loadRandomProfile);
       els.newSessionBtn.addEventListener("click", restartSession);
       els.input.addEventListener("keydown", (event) => {
-        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
           sendMessage();
         }
       });

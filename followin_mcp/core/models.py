@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List
 
+from .event_types import EventType
+
 
 @dataclass
 class Entities:
@@ -28,10 +30,11 @@ class ContentItem:
     language: str
 
     entities: Entities = field(default_factory=Entities)
-    event_type: str = "unknown"
+    event_type: EventType = EventType.UNKNOWN
     importance_score: float = 0.0
     credibility_score: float = 0.5
     engagement_score: float = 0.0
+    semantic_match_score: float = 0.0
     raw_tags: List[str] = field(default_factory=list)
     entity_sources: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
     entity_confidence: Dict[str, Dict[str, str]] = field(default_factory=dict)
@@ -41,7 +44,7 @@ class ContentItem:
 class EventCluster:
     event_id: str
     title: str
-    event_type: str
+    event_type: EventType
     entities: Entities
     first_seen_at: datetime
     last_updated_at: datetime
