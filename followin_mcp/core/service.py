@@ -62,6 +62,9 @@ class FollowinMCPService:
         self._feed_snapshot_buffer_size = int(
             os.getenv("FOLLOWIN_FEED_SNAPSHOT_BUFFER_SIZE", "20")
         )
+        self._feed_snapshot_refill_threshold = int(
+            os.getenv("FOLLOWIN_FEED_SNAPSHOT_REFILL_THRESHOLD", "8")
+        )
         self._start_semantic_warmup()
 
     # Read APIs
@@ -179,21 +182,35 @@ class FollowinMCPService:
         # the private pipeline own the internal stage orchestration.
         session = self._get_or_create_feed_session(user=user, query=query, cursor=cursor)
         effective_query = session.query if cursor and session.query is not None else query
+        target_buffer_size = max(max_items, self._feed_snapshot_buffer_size)
+        refill_threshold = max(max_items, self._feed_snapshot_refill_threshold)
+        pending_before = len(session.pending_clusters)
         logger.info(
-            "[feed] request: session_id=%s incoming_cursor=%s effective_query=%r max_items=%s pending_before=%s delivered_events=%s",
+            "[feed] request: session_id=%s incoming_cursor=%s effective_query=%r max_items=%s pending_before=%s delivered_events=%s refill_threshold=%s target_buffer=%s",
             session.session_id,
             cursor or "",
             (effective_query or "").strip()[:80],
             max_items,
-            len(session.pending_clusters),
+            pending_before,
             len(session.delivered_event_ids),
+            refill_threshold,
+            target_buffer_size,
         )
-        has_more_sources = self._fill_feed_snapshot_buffer(
-            user=user,
-            query=effective_query,
-            session=session,
-            min_buffer_size=max(max_items, self._feed_snapshot_buffer_size),
-        )
+        has_more_sources = False
+        if pending_before < refill_threshold:
+            has_more_sources = self._fill_feed_snapshot_buffer(
+                user=user,
+                query=effective_query,
+                session=session,
+                target_buffer_size=target_buffer_size,
+            )
+        else:
+            logger.info(
+                "[feed] buffer refill skipped: session_id=%s pending=%s threshold=%s",
+                session.session_id,
+                pending_before,
+                refill_threshold,
+            )
 
         page_clusters: List[EventCluster] = []
         with self._feed_session_lock:
@@ -227,21 +244,21 @@ class FollowinMCPService:
         user: UserProfile,
         query: str | None,
         session: FeedSessionState,
-        min_buffer_size: int,
+        target_buffer_size: int,
     ) -> bool:
         has_more_sources = False
-        remaining_slots = max(1, min_buffer_size)
+        remaining_slots = max(1, target_buffer_size)
         logger.info(
             "[feed] buffer fill start: session_id=%s target=%s pending=%s",
             session.session_id,
-            min_buffer_size,
+            target_buffer_size,
             len(session.pending_clusters),
         )
 
         while True:
             with self._feed_session_lock:
                 pending_count = len(session.pending_clusters)
-            if pending_count >= min_buffer_size:
+            if pending_count >= target_buffer_size:
                 logger.info(
                     "[feed] buffer fill satisfied: session_id=%s pending=%s",
                     session.session_id,
@@ -275,10 +292,10 @@ class FollowinMCPService:
                 session.updated_at = time.time()
                 pending_count = len(session.pending_clusters)
 
-            if pending_count >= min_buffer_size or not source_has_more:
+            if pending_count >= target_buffer_size or not source_has_more:
                 return pending_count > 0 or has_more_sources
 
-            remaining_slots = max(1, min_buffer_size - pending_count)
+            remaining_slots = max(1, target_buffer_size - pending_count)
 
     # Internal feed pipeline
 

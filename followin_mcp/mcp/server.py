@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import asdict
 from functools import lru_cache
 from typing import Any, Dict, List
@@ -11,6 +12,9 @@ from mcp.server.fastmcp import FastMCP
 from ..core.adapters import FollowinAPIAdapter
 from ..core.models import ContentItem, UserProfile
 from ..core.service import FollowinMCPService
+
+
+logger = logging.getLogger("followin_mcp.mcp.server")
 
 
 def _item_to_dict(item: ContentItem) -> Dict[str, Any]:
@@ -198,6 +202,7 @@ def get_personal_feed(
     cursor: str | None = None,
 ) -> Dict[str, Any]:
     """Build a personalized crypto feed and continue it with a feed session cursor."""
+    logger.info("[mcp] get_personal_feed start: max_items=%s cursor=%s", max_items, bool(cursor))
     profile = UserProfile(**user)
     payload = _build_service().build_personal_feed_payload(
         user=profile,
@@ -225,6 +230,12 @@ def get_personal_feed(
     if "next_cursor" in payload:
         response["next_cursor"] = payload["next_cursor"]
     response["has_more"] = bool(payload.get("has_more"))
+    logger.info(
+        "[mcp] get_personal_feed return: clusters=%s items=%s has_more=%s",
+        len(response["ranked_clusters"]),
+        len(response["items"]),
+        response["has_more"],
+    )
     return response
 
 

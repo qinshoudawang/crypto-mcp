@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict
 from importlib.util import find_spec
@@ -15,6 +16,15 @@ from pydantic import BaseModel, Field
 
 from ..core.models import ContentItem, UserProfile
 from .mcp_client import FollowinMCPClient
+
+
+logger = logging.getLogger("followin_mcp.demo.agent")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[agent] %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(getattr(logging, os.getenv("FOLLOWIN_AGENT_LOG_LEVEL", "INFO").upper(), logging.INFO))
+logger.propagate = False
 
 
 def serialize_item(item: ContentItem) -> Dict[str, Any]:
@@ -40,10 +50,27 @@ def summarize_profile(user: UserProfile) -> str:
 
 def compact_item(item: Dict[str, Any]) -> Dict[str, Any]:
     entities = item.get("entities", {}) if isinstance(item, dict) else {}
+    title = (
+        item.get("title")
+        or item.get("name")
+        or item.get("topic_name")
+        or item.get("topic")
+        or item.get("content")
+        or item.get("text")
+        or item.get("body")
+        or ""
+    )
+    summary = (
+        item.get("summary")
+        or item.get("content")
+        or item.get("text")
+        or item.get("body")
+        or ""
+    )
     return {
         "id": item.get("id", ""),
-        "title": item.get("title", ""),
-        "summary": item.get("summary", ""),
+        "title": title,
+        "summary": summary,
         "source_name": item.get("source_name", ""),
         "published_at": item.get("published_at", ""),
         "url": item.get("url", ""),
@@ -492,6 +519,7 @@ class FollowinChatAgent:
         max_items: int = 5,
         cursor: str | None = None,
     ) -> str:
+        logger.info("[agent] get_personal_feed start: max_items=%s cursor=%s", max_items, bool(cursor))
         result = self.mcp_client.call_tool(
             "get_personal_feed",
             {
@@ -501,6 +529,7 @@ class FollowinChatAgent:
                 "cursor": cursor or "",
             },
         )
+        logger.info("[agent] get_personal_feed result received")
         if not isinstance(result, dict):
             raise RuntimeError("MCP tool get_personal_feed returned non-dict payload.")
 

@@ -26,6 +26,61 @@ def _terminate(process: subprocess.Popen[bytes], name: str) -> None:
         process.wait(timeout=5)
 
 
+def _cleanup_stale_processes() -> None:
+    patterns = [
+        "python3 -m followin_mcp.mcp.server",
+        "python -m followin_mcp.mcp.server",
+        "python3 -m followin_mcp.demo.webapp",
+        "python -m followin_mcp.demo.webapp",
+    ]
+
+    try:
+        output = subprocess.check_output(
+            ["ps", "-axo", "pid=,command="],
+            text=True,
+        )
+    except Exception:
+        return
+
+    current_pid = os.getpid()
+    stale_pids: list[int] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_text, command = line.split(None, 1)
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if any(pattern in command for pattern in patterns):
+            stale_pids.append(pid)
+
+    if not stale_pids:
+        return
+
+    print(f"[dev] cleaning stale processes: {', '.join(str(pid) for pid in stale_pids)}")
+    for pid in stale_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+
+    time.sleep(0.5)
+
+    for pid in stale_pids:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            continue
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Start the Followin MCP server and web demo as separate processes.")
     parser.add_argument("--host", default=os.getenv("FOLLOWIN_WEB_HOST", "127.0.0.1"))
@@ -53,6 +108,8 @@ def main() -> None:
     missing = [name for name in required_vars if not env.get(name)]
     if missing:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+
+    _cleanup_stale_processes()
 
     processes = [
         (

@@ -4,16 +4,29 @@ import asyncio
 import json
 import os
 import threading
+import logging
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 import httpx
 from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+try:
+    from mcp.client.streamable_http import streamable_http_client
+    _MCP_STREAMABLE_HTTP_USES_HTTP_CLIENT = True
+except ImportError:  # mcp<=1.22
+    from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
+    _MCP_STREAMABLE_HTTP_USES_HTTP_CLIENT = False
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+logger = logging.getLogger("followin_mcp.demo.mcp_client")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[mcp-client] %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(getattr(logging, os.getenv("FOLLOWIN_MCP_CLIENT_LOG_LEVEL", "INFO").upper(), logging.INFO))
+logger.propagate = False
 
 
 class FollowinMCPClient:
@@ -80,14 +93,22 @@ class FollowinMCPClient:
 
     async def _startup_runtime(self) -> None:
         self._exit_stack = AsyncExitStack()
-        self._http_client = httpx.AsyncClient(headers=self.headers)
-        await self._exit_stack.enter_async_context(self._http_client)
-        read_stream, write_stream, _get_session_id = await self._exit_stack.enter_async_context(
-            streamable_http_client(
-                self.server_url,
-                http_client=self._http_client,
+        if _MCP_STREAMABLE_HTTP_USES_HTTP_CLIENT:
+            self._http_client = httpx.AsyncClient(headers=self.headers)
+            await self._exit_stack.enter_async_context(self._http_client)
+            read_stream, write_stream, get_session_id = await self._exit_stack.enter_async_context(
+                streamable_http_client(
+                    self.server_url,
+                    http_client=self._http_client,
+                )
             )
-        )
+        else:
+            read_stream, write_stream, get_session_id = await self._exit_stack.enter_async_context(
+                streamable_http_client(
+                    self.server_url,
+                    headers=self.headers,
+                )
+            )
         self._session = await self._exit_stack.enter_async_context(
             ClientSession(read_stream, write_stream)
         )
@@ -106,6 +127,7 @@ class FollowinMCPClient:
         call_args = arguments or {}
         if self._session is None or self._session_lock is None:
             raise RuntimeError("MCP client session is not initialized.")
+        logger.info("[mcp-client] call start: tool=%s", name)
 
         async def on_progress(progress: float, total: float | None, message: str | None) -> None:
             self._emit_event(
@@ -154,6 +176,7 @@ class FollowinMCPClient:
                 "tool_name": name,
             }
         )
+        logger.info("[mcp-client] call done: tool=%s", name)
         return decoded
 
     async def _list_tool_names_async(self) -> List[str]:
