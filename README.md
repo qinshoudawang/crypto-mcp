@@ -379,3 +379,43 @@ python3 -m followin_mcp.mcp.server
 ```bash
 followin-mcp-server
 ```
+
+## ACP Agent
+
+如果你想把当前对话 agent 作为 ACP stdio agent 暴露给支持 ACP 的客户端，可以启动：
+
+```bash
+python3 -m followin_mcp.acp.server
+```
+
+或者安装后使用：
+
+```bash
+followin-acp-agent
+```
+
+当前 ACP wrapper 直接复用 `FollowinChatAgent`：
+
+- ACP session 对应一条 `FollowinChatAgent` 会话
+- `prompt()` 内部调用现有的 `chat_stream()`
+- assistant 文本按流式 chunk 回传给 ACP client
+- 用户画像默认读取 `FOLLOWIN_ACP_PROFILE_JSON`，未配置时使用一个内置默认画像
+
+如果你要接到本地 `acpx` / OpenClaw，`~/.acpx/config.json` 可以先用最小配置：
+
+```json
+{
+  "agents": {
+    "followin": {
+      "command": "/path/to/python",
+      "args": ["-m", "followin_mcp.acp.server"],
+      "cwd": "/path/to/followin-mcp"
+    }
+  }
+}
+```
+
+这里不需要额外写 `env`：
+
+- `followin_mcp.acp.server` 启动时已经会 `load_dotenv()`
+- 只要 `cwd` 指到项目根目录，就会读取仓库里的 `.env`

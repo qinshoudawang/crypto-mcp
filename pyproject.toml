@@ -9,6 +9,7 @@ description = "A crypto-focused Followin MCP prototype with normalization, clust
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "agent-client-protocol>=0.6.3",
     "fastapi>=0.115.0",
     "langchain>=0.3.0",
     "langchain-core>=0.3.0",
@@ -21,6 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
+followin-acp-agent = "followin_mcp.acp.server:main"
 followin-mcp-dev = "followin_mcp.dev:main"
 followin-mcp-server = "followin_mcp.mcp.server:main"
 followin-mcp-web = "followin_mcp.demo.webapp:main"
@@ -28,6 +30,7 @@ followin-mcp-web = "followin_mcp.demo.webapp:main"
 [tool.setuptools]
 packages = [
     "followin_mcp",
+    "followin_mcp.acp",
     "followin_mcp.core",
     "followin_mcp.demo",
     "followin_mcp.mcp",
