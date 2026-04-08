@@ -152,6 +152,7 @@ class FollowinChatAgent:
         self.history = InMemoryChatMessageHistory()
         self.tool_runs: List[Dict[str, Any]] = []
         self.recent_tool_state: List[Dict[str, Any]] = []
+        self.recent_shown_results: List[Dict[str, Any]] = []
         self._current_user_message = ""
 
         self._normalize_proxy_env()
@@ -173,6 +174,7 @@ class FollowinChatAgent:
             return False
         self.user = user
         self.recent_tool_state = []
+        self.recent_shown_results = []
         self.agent = self._build_agent()
         return True
 
@@ -200,6 +202,7 @@ class FollowinChatAgent:
             "Use the user context for ranking, but keep the wording natural.\n"
             "For recommendation answers, avoid repetitive personalized recommendation templates unless the user explicitly asks for personalized reasoning.\n"
             "When the user asks for more, the next page, or another batch of the same results, reuse the most recent relevant tool and pass along its cursor if one was returned.\n"
+            "Passing a cursor continues the feed and fetches the next unseen batch; it is not for revisiting previously shown results.\n"
             "Use the prior conversation and prior tool outputs deliberately in follow-up turns. "
             "When the user asks to expand on something already shown, prefer grounding on the previously returned results before calling tools again."
         )
@@ -260,6 +263,90 @@ class FollowinChatAgent:
                 lines.append(
                     f"- {state.get('tool_name', '')}: {json.dumps(next_cursor, ensure_ascii=False)}"
                 )
+        return "\n".join(lines)
+
+    def _remember_shown_results(
+        self,
+        tool_name: str,
+        ranked_clusters: List[Dict[str, Any]] | None = None,
+        items: List[Dict[str, Any]] | None = None,
+    ) -> None:
+        entries: List[Dict[str, Any]] = []
+        if ranked_clusters:
+            for rank, cluster in enumerate(ranked_clusters, start=1):
+                if not isinstance(cluster, dict):
+                    continue
+                entities = cluster.get("entities", {}) if isinstance(cluster.get("entities"), dict) else {}
+                item_titles = []
+                for item in cluster.get("items", [])[:3]:
+                    if isinstance(item, dict):
+                        title = (
+                            item.get("title")
+                            or item.get("name")
+                            or item.get("content")
+                            or item.get("text")
+                            or ""
+                        )
+                        if title:
+                            item_titles.append(title)
+                entries.append(
+                    {
+                        "tool_name": tool_name,
+                        "kind": "cluster",
+                        "rank": rank,
+                        "title": cluster.get("title", ""),
+                        "event_type": cluster.get("event_type", "unknown"),
+                        "projects": list(entities.get("projects", []))[:3],
+                        "topics": list(entities.get("topics", []))[:3],
+                        "item_titles": item_titles,
+                    }
+                )
+        elif items:
+            for rank, item in enumerate(items, start=1):
+                if not isinstance(item, dict):
+                    continue
+                entries.append(
+                    {
+                        "tool_name": tool_name,
+                        "kind": "item",
+                        "rank": rank,
+                        "title": item.get("title", ""),
+                        "event_type": item.get("event_type", "unknown"),
+                        "projects": list(item.get("projects", []))[:3],
+                        "topics": list(item.get("topics", []))[:3],
+                    }
+                )
+
+        if not entries:
+            return
+        self.recent_shown_results.extend(entries)
+        self.recent_shown_results = self.recent_shown_results[-20:]
+
+    def _shown_results_context(self) -> str:
+        if not self.recent_shown_results:
+            return ""
+
+        lines = [
+            "Recently shown results you can reference before calling tools again:",
+        ]
+        for entry in self.recent_shown_results[-10:]:
+            parts = [
+                f"- {entry.get('tool_name', '')} #{entry.get('rank', '')}",
+                json.dumps(entry.get("title", ""), ensure_ascii=False),
+            ]
+            event_type = entry.get("event_type")
+            if event_type:
+                parts.append(f"event_type={event_type}")
+            projects = entry.get("projects") or []
+            if projects:
+                parts.append(f"projects={json.dumps(projects, ensure_ascii=False)}")
+            topics = entry.get("topics") or []
+            if topics:
+                parts.append(f"topics={json.dumps(topics, ensure_ascii=False)}")
+            item_titles = entry.get("item_titles") or []
+            if item_titles:
+                parts.append(f"supporting_titles={json.dumps(item_titles, ensure_ascii=False)}")
+            lines.append(" | ".join(parts))
         return "\n".join(lines)
 
     def _call_items_tool(self, tool_name: str, arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -353,6 +440,7 @@ class FollowinChatAgent:
         if not isinstance(items, list):
             raise RuntimeError("MCP tool get_latest_headlines returned unexpected payload.")
         compact = [compact_item(item) for item in items[:limit]]
+        self._remember_shown_results("get_latest_headlines", items=compact)
         return self._record_tool_run(
             "get_latest_headlines",
             {
@@ -383,6 +471,7 @@ class FollowinChatAgent:
         if not isinstance(items, list):
             raise RuntimeError("MCP tool get_trending_feeds returned unexpected payload.")
         compact = [compact_item(item) for item in items[:limit]]
+        self._remember_shown_results("get_trending_feeds", items=compact)
         return self._record_tool_run(
             "get_trending_feeds",
             {"feed_type": feed_type, "limit": limit},
@@ -414,6 +503,7 @@ class FollowinChatAgent:
         if not isinstance(items, list):
             raise RuntimeError("MCP tool get_project_feed returned unexpected payload.")
         compact = [compact_item(item) for item in items[:limit]]
+        self._remember_shown_results("get_project_feed", items=compact)
         return self._record_tool_run(
             "get_project_feed",
             {"symbol": symbol, "feed_type": feed_type, "limit": limit, "cursor": cursor or ""},
@@ -444,6 +534,7 @@ class FollowinChatAgent:
         if not isinstance(items, list):
             raise RuntimeError("MCP tool get_project_opinions returned unexpected payload.")
         compact = [compact_item(item) for item in items[:limit]]
+        self._remember_shown_results("get_project_opinions", items=compact)
         return self._record_tool_run(
             "get_project_opinions",
             {"symbol": symbol, "limit": limit, "cursor": cursor or ""},
@@ -469,6 +560,7 @@ class FollowinChatAgent:
         if not isinstance(items, list):
             raise RuntimeError("MCP tool search_content returned unexpected payload.")
         compact = [compact_item(item) for item in items[:limit]]
+        self._remember_shown_results("search_content", items=compact)
         return self._record_tool_run(
             "search_content",
             {"query": query, "limit": limit},
@@ -491,6 +583,9 @@ class FollowinChatAgent:
         else:
             extra = {}
         compact = topics[:limit] if isinstance(topics, list) else []
+        if isinstance(compact, list):
+            shown = [item for item in compact if isinstance(item, dict)]
+            self._remember_shown_results("get_trending_topics", items=shown)
         return self._record_tool_run(
             "get_trending_topics",
             {"limit": limit, "cursor": cursor or ""},
@@ -545,6 +640,11 @@ class FollowinChatAgent:
             **extra,
         }
         self.tool_runs.append(tool_payload)
+        self._remember_shown_results(
+            "get_personal_feed",
+            ranked_clusters=ranked_clusters,
+            items=top_items,
+        )
         self._remember_tool_state(
             "get_personal_feed",
             {
@@ -563,6 +663,9 @@ class FollowinChatAgent:
         tool_state_context = self._tool_state_context()
         if tool_state_context:
             input_messages.append(SystemMessage(content=tool_state_context))
+        shown_results_context = self._shown_results_context()
+        if shown_results_context:
+            input_messages.append(SystemMessage(content=shown_results_context))
         input_messages.append(HumanMessage(content=user_message))
         result = self.agent.invoke({"messages": input_messages})
         messages = result["messages"]
@@ -643,6 +746,9 @@ class FollowinChatAgent:
         tool_state_context = self._tool_state_context()
         if tool_state_context:
             input_messages.append(SystemMessage(content=tool_state_context))
+        shown_results_context = self._shown_results_context()
+        if shown_results_context:
+            input_messages.append(SystemMessage(content=shown_results_context))
         input_messages.append(HumanMessage(content=user_message))
         final_state: Dict[str, Any] | None = None
         streamed_parts: List[str] = []
